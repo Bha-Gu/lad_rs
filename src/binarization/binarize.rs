@@ -1,12 +1,10 @@
 use std::cmp::Ordering;
 
 use polars::prelude::*;
-use pyo3::{
-    exceptions::{PyRuntimeError, PyTypeError},
-    prelude::*,
-};
+use pyo3::{exceptions::PyRuntimeError, prelude::*};
 use pyo3_polars::{PyDataFrame, PySeries};
 
+#[derive(Clone)]
 #[pyclass]
 pub struct Binarizer {
     cutpoints: Vec<Series>,
