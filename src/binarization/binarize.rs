@@ -114,6 +114,9 @@ impl Binarizer {
             .sum::<f64>()
             / (runer.len() - 1) as f64;
 
-        sum - score
+        let x = sum - score;
+
+        let k = -2.0 + (2.0_f64).powi(runer.len() as i32 - 1);
+        x / (1.0 + k * (1.0 - x))
     }
 }
