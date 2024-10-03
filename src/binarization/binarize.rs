@@ -1,3 +1,5 @@
+use std::cmp::Ordering;
+
 use polars::prelude::*;
 use pyo3::{
     exceptions::{PyRuntimeError, PyTypeError},
@@ -15,7 +17,7 @@ pub struct Binarizer {
 #[pymethods]
 impl Binarizer {
     #[new]
-    pub fn new(threshold: f64, nominal_size: usize) -> Self {
+    pub const fn new(threshold: f64, nominal_size: usize) -> Self {
         Self {
             cutpoints: Vec::new(),
             threshold,
@@ -29,7 +31,7 @@ impl Binarizer {
 
     #[pyo3(name = "generate_cutpoints")]
     pub fn generate_cutpoints_py(&mut self, X: PyDataFrame, y: PySeries) -> PyResult<()> {
-        match self.generate_cutpoints(X.into(), y.into(), self.threshold) {
+        match self.generate_cutpoints(&X.into(), &y.into(), self.threshold) {
             Ok(a) => Ok(a),
             Err(e) => Err(PyErr::new::<PyRuntimeError, _>(e.to_string())),
         }
@@ -47,7 +49,7 @@ impl Binarizer {
         }
 
         // Iterate over each feature (column) and apply corresponding cutpoints
-        for (_idx, cutpoints) in self.cutpoints.iter().enumerate() {
+        for cutpoints in &self.cutpoints {
             let feature_name = cutpoints.name();
             let dtype = cutpoints.dtype();
             // Ensure the feature exists in the DataFrame
@@ -63,11 +65,7 @@ impl Binarizer {
                                     false // Value is greater than or equal to the cutpoint
                                 }
                             } else {
-                                if value == cp {
-                                    true
-                                } else {
-                                    false
-                                }
+                                value == cp
                             }
                         })
                         .collect::<Vec<_>>();
@@ -83,8 +81,7 @@ impl Binarizer {
             } else {
                 // If feature is not found, raise an error
                 return Err(PyErr::new::<PyRuntimeError, _>(format!(
-                    "Feature '{}' not found in DataFrame",
-                    feature_name
+                    "Feature '{feature_name}' not found in DataFrame"
                 )));
             }
         }
@@ -97,8 +94,8 @@ impl Binarizer {
 impl Binarizer {
     pub fn generate_cutpoints(
         &mut self,
-        X: DataFrame,
-        y: Series,
+        X: &DataFrame,
+        y: &Series,
         threshold: f64,
     ) -> Result<(), PolarsError> {
         let schema = X.schema();
@@ -106,7 +103,6 @@ impl Binarizer {
         let features = schema.iter_names();
         let unique_labels = y.unique_stable()?;
         let mut label_counts = vec![0u128; unique_labels.len()];
-        let mut running_counts = vec![0u128; unique_labels.len()];
         for l in y.iter() {
             for (j, lj) in unique_labels.iter().enumerate() {
                 if lj == l {
@@ -117,42 +113,54 @@ impl Binarizer {
         }
         let label_counts = label_counts;
         for (idx, feature) in features.enumerate() {
-            println!("{feature}");
             let s = X[idx].clone();
             let a = s.n_unique()?;
-            //println!("  {s:?}\n  {a}");
             let mut col_y = DataFrame::new(vec![y.clone(), s])?;
-            //println!("  {col_y:?}");
             if let Some((_, dtype)) = schema.get_at_index(idx) {
-                println!("  {dtype}");
                 if dtype.is_numeric() && a >= self.nominal_size {
                     //let mut cutpoints = Series::new(*feature, []);
-                    col_y = col_y.sort([feature.to_string()], Default::default())?;
+                    let mut running_counts = vec![0u128; unique_labels.len()];
+                    col_y = col_y.sort([feature.to_string()], SortMultipleOptions::default())?;
                     let mut cps = Vec::new();
-                    let sorted = col_y.drop_in_place(&feature.to_string())?;
-                    let labels = col_y.drop_in_place(&y.name().to_string())?;
+                    let sorted = col_y.drop_in_place(feature.as_ref())?;
+                    let labels = col_y.drop_in_place(y.name().as_ref())?;
                     let mut prev_label = labels.get(0)?;
                     let mut prev_value = sorted.get(0)?;
                     running_counts[labels.iter().position(|x| x == prev_label).unwrap()] += 1;
                     for (s, l) in sorted.iter().zip(labels.iter()).skip(1) {
                         let score = Self::score(&running_counts, &label_counts);
-                        println!("    {score}");
                         running_counts[unique_labels.iter().position(|x| x == l).unwrap()] += 1;
-                        if prev_label != l {
-                            if prev_value != s {
-                                if score >= threshold {
-                                    cps.push(
-                                        Series::new("tmp".into(), [s.clone(), prev_value.clone()])
-                                            .mean()
-                                            .unwrap(),
-                                    );
-                                }
-                                prev_value = s;
-                                prev_label = l;
+                        if prev_label != l && prev_value != s {
+                            if score >= threshold {
+                                cps.push((
+                                    Series::new("tmp".into(), [s.clone(), prev_value.clone()])
+                                        .mean()
+                                        .unwrap(),
+                                    score,
+                                ));
                             }
+                            prev_value = s;
+                            prev_label = l;
                         }
                     }
-                    println!("{cps:?}");
+                    cps.sort_by(|(_, a), (_, b)| {
+                        if a.is_nan() {
+                            Ordering::Greater
+                        } else if b.is_nan() {
+                            Ordering::Less
+                        } else {
+                            a.partial_cmp(b).unwrap()
+                        }
+                    });
+                    let cps = cps
+                        .iter()
+                        .rev()
+                        .map(|(x, s)| {
+                            print!("{s} ");
+                            *x
+                        })
+                        .collect::<Vec<_>>();
+                    println!();
                     self.cutpoints.push(Series::new(feature.clone(), cps));
                 } else {
                     self.cutpoints.push(
@@ -160,32 +168,14 @@ impl Binarizer {
                             .drop_in_place(feature)?
                             .unique()?
                             .cast(&DataType::String)?,
-                    )
+                    );
                 }
             }
         }
         Ok(())
     }
 
-    fn score(runner: &Vec<u128>, total: &Vec<u128>) -> f64 {
-        //let sum: f64 = runner
-        //    .iter()
-        //    .zip(total.iter())
-        //    .map(|(&r, &t)| r as f64 / t as f64)
-        //    .sum();
-        //
-        //let score = runner
-        //    .iter()
-        //    .zip(total.iter())
-        //    .map(|(&r, &t)| {
-        //        let rate = r as f64 / t as f64;
-        //        rate * (sum - rate)
-        //    })
-        //    .sum::<f64>()
-        //    / (runner.len() - 1) as f64;
-        //
-        //let x = sum - score;
-
+    fn score(runner: &[u128], total: &[u128]) -> f64 {
         let rates = runner
             .iter()
             .zip(total.iter())
@@ -199,8 +189,6 @@ impl Binarizer {
 
         let k = -2.0 + (2.0_f64).powi(runner.len() as i32 - 1);
 
-        println!("{sum:.2} - {score:.2} = {x:.2}, scaled by {k:.2}");
-
-        x / (1.0 + k * (1.0 - x))
+        x / k.mul_add(1.0 - x, 1.0)
     }
 }
