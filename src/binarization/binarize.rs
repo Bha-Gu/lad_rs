@@ -37,6 +37,7 @@ impl Binarizer {
 
     pub fn transform(&self, X: PyDataFrame) -> PyResult<PyDataFrame> {
         // Convert PyDataFrame into a Polars DataFrame
+        println!("Debug0");
         let df: DataFrame = X.into();
         let mut out = DataFrame::default();
         // Check if cutpoints are available
@@ -46,8 +47,11 @@ impl Binarizer {
             ));
         }
 
+        println!("Debug1");
+
         // Iterate over each feature (column) and apply corresponding cutpoints
         for cutpoints in &self.cutpoints {
+            println!("Debug2");
             let feature_name = cutpoints.name();
             let dtype = cutpoints.dtype();
             // Ensure the feature exists in the DataFrame
