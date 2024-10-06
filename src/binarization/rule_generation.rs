@@ -1,7 +1,7 @@
 use std::collections::HashSet;
 
 use polars::prelude::*;
-use pyo3::{exceptions::PyRuntimeError, prelude::*, types::PyDict};
+use pyo3::prelude::*;
 use pyo3_polars::{PyDataFrame, PySeries};
 
 use super::binarize::Binarizer;
@@ -27,24 +27,23 @@ impl RuleGenerator {
     }
 
     pub fn get_rules(&self) -> Vec<(String, HashSet<(bool, String)>)> {
-        return self.rules.clone();
+        self.rules.clone()
     }
 
-    pub fn fit(&mut self, X: PyDataFrame, y: PySeries) -> PyResult<()> {
+    pub fn fit(&mut self, data: PyDataFrame, labels: PySeries) {
         //println!("Debug0");
-        let df: DataFrame = X.into(); // Extract the Polars DataFrame
-        let y_series: Series = y.into(); // Extract the Polars Series
+        let df: DataFrame = data.into(); // Extract the Polars DataFrame
+        let y_series: Series = labels.into(); // Extract the Polars Series
         let features = df.get_column_names();
         // Ensure y is categorical or can be grouped
         let unique_y = y_series.unique_stable().unwrap();
-        let unique_y = unique_y.iter().collect::<Vec<_>>();
         self.labels = unique_y.iter().map(|x| format!("{x}")).collect();
         // Initialize a Vec to hold the resulting DataFrames
         let mut grouped_dfs: Vec<DataFrame> = Vec::new();
 
         //println!("Debug1");
         // Iterate through unique y values
-        for value in unique_y {
+        for value in unique_y.iter() {
             // Filter the DataFrame rows where y equals the current unique value
             let mask = y_series.iter().map(|x| x == value).collect();
             let sub_df = match df.filter(&mask) {
@@ -96,7 +95,7 @@ impl RuleGenerator {
                             let a = next_pattern
                                 .iter()
                                 .map(|(v, c)| {
-                                    x.column(&c)
+                                    x.column(c)
                                         .unwrap()
                                         .iter()
                                         .map(|val| {
@@ -111,16 +110,13 @@ impl RuleGenerator {
                                 .map(|i| a.iter().all(|inner| inner[i]))
                                 .collect()
                         };
-                        let shapes = grouped_dfs.iter().map(|x| x.shape()).collect::<Vec<_>>();
+                        let shapes = grouped_dfs.iter().map(DataFrame::shape).collect::<Vec<_>>();
                         //println!("{shapes:?}");
                         let counts: Vec<_> = grouped_dfs
                             .iter()
                             .map(|x| x.filter(&mask(x).into_iter().collect()).unwrap().shape().0)
                             .collect();
-                        let tmp = counts
-                            .iter()
-                            .map(|x| if *x >= 1 { 1 } else { 0 })
-                            .sum::<usize>();
+                        let tmp = counts.iter().map(|x| usize::from(*x >= 1)).sum::<usize>();
 
                         //println!("0: {counts:?} {tmp}");
                         if tmp == 1 {
@@ -148,11 +144,11 @@ impl RuleGenerator {
                 }
             }
 
-            let shapes = grouped_dfs.iter().map(|x| x.shape()).collect::<Vec<_>>();
+            let shapes = grouped_dfs.iter().map(|x| x.shape().0).collect::<Vec<_>>();
 
             println!("{shapes:?}");
 
-            if shapes.iter().map(|x| x.0).sum::<usize>() == 0 {
+            if shapes.iter().sum::<usize>() == 0 {
                 break;
             }
 
@@ -160,6 +156,5 @@ impl RuleGenerator {
         }
 
         self.rules = prime_patterns;
-        Ok(())
     }
 }

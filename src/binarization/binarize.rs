@@ -15,6 +15,7 @@ pub struct Binarizer {
 #[pymethods]
 impl Binarizer {
     #[new]
+    #[pyo3(signature = (threshold, nominal_size=2))]
     pub const fn new(threshold: f64, nominal_size: usize) -> Self {
         Self {
             cutpoints: Vec::new(),
@@ -28,17 +29,17 @@ impl Binarizer {
     }
 
     #[pyo3(name = "generate_cutpoints")]
-    pub fn generate_cutpoints_py(&mut self, X: PyDataFrame, y: PySeries) -> PyResult<()> {
-        match self.generate_cutpoints(&X.into(), &y.into(), self.threshold) {
+    pub fn generate_cutpoints_py(&mut self, data: PyDataFrame, label: PySeries) -> PyResult<()> {
+        match self.generate_cutpoints(&data.into(), &label.into(), self.threshold) {
             Ok(a) => Ok(a),
             Err(e) => Err(PyErr::new::<PyRuntimeError, _>(e.to_string())),
         }
     }
 
-    pub fn transform(&self, X: PyDataFrame) -> PyResult<PyDataFrame> {
+    pub fn transform(&self, data: PyDataFrame) -> PyResult<PyDataFrame> {
         // Convert PyDataFrame into a Polars DataFrame
+        let df: DataFrame = data.into();
         println!("Debug0");
-        let df: DataFrame = X.into();
         let mut out = DataFrame::default();
         // Check if cutpoints are available
         if self.cutpoints.is_empty() {
@@ -96,16 +97,15 @@ impl Binarizer {
 impl Binarizer {
     pub fn generate_cutpoints(
         &mut self,
-        X: &DataFrame,
-        y: &Series,
+        data: &DataFrame,
+        label: &Series,
         threshold: f64,
     ) -> Result<(), PolarsError> {
-        let schema = X.schema();
+        let schema = data.schema();
         self.cutpoints = Vec::new();
-        let features = schema.iter_names();
-        let unique_labels = y.unique_stable()?;
+        let unique_labels = label.unique_stable()?;
         let mut label_counts = vec![0u128; unique_labels.len()];
-        for l in y.iter() {
+        for l in label.iter() {
             for (j, lj) in unique_labels.iter().enumerate() {
                 if lj == l {
                     label_counts[j] += 1;
@@ -114,220 +114,61 @@ impl Binarizer {
             }
         }
         let label_counts = label_counts;
-        for (idx, feature) in features.enumerate() {
-            let s = X[idx].clone();
-            let a = s.n_unique()?;
-            let mut col_y = DataFrame::new(vec![y.clone(), s])?;
-            if let Some((_, dtype)) = schema.get_at_index(idx) {
-                match dtype {
-                    DataType::Boolean => todo!(),
-                    DataType::UInt8 | DataType::UInt16 | DataType::UInt32 | DataType::UInt64 => {
-                        let mut running_counts = vec![0u128; unique_labels.len()];
-                        col_y =
-                            col_y.sort([feature.to_string()], SortMultipleOptions::default())?;
-                        let mut cps = Vec::new();
-                        let sorted = col_y.drop_in_place(feature.as_ref())?;
-                        let labels = col_y.drop_in_place(y.name().as_ref())?;
-                        let mut prev_label = labels.get(0)?;
-                        let mut prev_value = sorted.get(0)?;
-                        running_counts[labels.iter().position(|x| x == prev_label).unwrap()] += 1;
-                        for (s, l) in sorted.iter().zip(labels.iter()).skip(1) {
-                            let score = Self::score(&running_counts, &label_counts);
-                            running_counts[unique_labels.iter().position(|x| x == l).unwrap()] += 1;
-                            if prev_label != l && prev_value != s {
-                                if score >= threshold {
-                                    cps.push((
-                                        Series::new("tmp".into(), [s.clone(), prev_value.clone()])
-                                            .mean()
-                                            .unwrap()
-                                            as u64,
-                                        score,
-                                    ));
-                                }
-                                prev_value = s;
-                                prev_label = l;
-                            }
+        for (idx, (feature_name, data_type)) in schema.iter().enumerate() {
+            let column = data[idx].clone();
+            let a = column.n_unique()?;
+            if a <= self.nominal_size {
+                continue;
+            }
+            let mut column_and_label = DataFrame::new(vec![label.clone(), column])?;
+            if data_type.is_numeric() {
+                let mut running_counts = vec![0u128; unique_labels.len()];
+                column_and_label = column_and_label
+                    .sort([feature_name.to_string()], SortMultipleOptions::default())?;
+                let mut cps = Vec::new();
+                let sorted = column_and_label.drop_in_place(feature_name.as_ref())?;
+                let labels = column_and_label.drop_in_place(label.name().as_ref())?;
+                let mut prev_label = labels.get(0)?;
+                let mut prev_value = sorted.get(0)?;
+                running_counts[labels.iter().position(|x| x == prev_label).unwrap()] += 1;
+                for (s, l) in sorted.iter().zip(labels.iter()).skip(1) {
+                    let score = Self::score(&running_counts, &label_counts);
+                    running_counts[unique_labels.iter().position(|x| x == l).unwrap()] += 1;
+                    if prev_label != l && prev_value != s {
+                        if score >= threshold {
+                            cps.push((
+                                AnyValue::from(
+                                    Series::new("tmp".into(), [s.clone(), prev_value.clone()])
+                                        .mean()
+                                        .unwrap(),
+                                )
+                                .cast(data_type),
+                                score,
+                            ));
                         }
-                        cps.sort_by(|(_, a), (_, b)| {
-                            if a.is_nan() {
-                                Ordering::Greater
-                            } else if b.is_nan() {
-                                Ordering::Less
-                            } else {
-                                a.partial_cmp(b).unwrap()
-                            }
-                        });
-                        let cps = cps
-                            .iter()
-                            .rev()
-                            .map(|(x, s)| {
-                                print!("{s} ");
-                                *x
-                            })
-                            .collect::<Vec<_>>();
-                        println!();
-                        self.cutpoints.push(Series::new(feature.clone(), cps));
+                        prev_value = s;
+                        prev_label = l;
                     }
-                    DataType::Int8 | DataType::Int16 | DataType::Int32 | DataType::Int64 => {
-                        let mut running_counts = vec![0u128; unique_labels.len()];
-                        col_y =
-                            col_y.sort([feature.to_string()], SortMultipleOptions::default())?;
-                        let mut cps = Vec::new();
-                        let sorted = col_y.drop_in_place(feature.as_ref())?;
-                        let labels = col_y.drop_in_place(y.name().as_ref())?;
-                        let mut prev_label = labels.get(0)?;
-                        let mut prev_value = sorted.get(0)?;
-                        running_counts[labels.iter().position(|x| x == prev_label).unwrap()] += 1;
-                        for (s, l) in sorted.iter().zip(labels.iter()).skip(1) {
-                            let score = Self::score(&running_counts, &label_counts);
-                            running_counts[unique_labels.iter().position(|x| x == l).unwrap()] += 1;
-                            if prev_label != l && prev_value != s {
-                                if score >= threshold {
-                                    cps.push((
-                                        Series::new("tmp".into(), [s.clone(), prev_value.clone()])
-                                            .mean()
-                                            .unwrap()
-                                            as i64,
-                                        score,
-                                    ));
-                                }
-                                prev_value = s;
-                                prev_label = l;
-                            }
-                        }
-                        cps.sort_by(|(_, a), (_, b)| {
-                            if a.is_nan() {
-                                Ordering::Greater
-                            } else if b.is_nan() {
-                                Ordering::Less
-                            } else {
-                                a.partial_cmp(b).unwrap()
-                            }
-                        });
-                        let cps = cps
-                            .iter()
-                            .rev()
-                            .map(|(x, s)| {
-                                print!("{s} ");
-                                *x
-                            })
-                            .collect::<Vec<_>>();
-                        println!();
-                        self.cutpoints.push(Series::new(feature.clone(), cps));
-                    }
-                    DataType::Float32 | DataType::Float64 => {
-                        let mut running_counts = vec![0u128; unique_labels.len()];
-                        col_y =
-                            col_y.sort([feature.to_string()], SortMultipleOptions::default())?;
-                        let mut cps = Vec::new();
-                        let sorted = col_y.drop_in_place(feature.as_ref())?;
-                        let labels = col_y.drop_in_place(y.name().as_ref())?;
-                        let mut prev_label = labels.get(0)?;
-                        let mut prev_value = sorted.get(0)?;
-                        running_counts[labels.iter().position(|x| x == prev_label).unwrap()] += 1;
-                        for (s, l) in sorted.iter().zip(labels.iter()).skip(1) {
-                            let score = Self::score(&running_counts, &label_counts);
-                            running_counts[unique_labels.iter().position(|x| x == l).unwrap()] += 1;
-                            if prev_label != l && prev_value != s {
-                                if score >= threshold {
-                                    cps.push((
-                                        Series::new("tmp".into(), [s.clone(), prev_value.clone()])
-                                            .mean()
-                                            .unwrap(),
-                                        score,
-                                    ));
-                                }
-                                prev_value = s;
-                                prev_label = l;
-                            }
-                        }
-                        cps.sort_by(|(_, a), (_, b)| {
-                            if a.is_nan() {
-                                Ordering::Greater
-                            } else if b.is_nan() {
-                                Ordering::Less
-                            } else {
-                                a.partial_cmp(b).unwrap()
-                            }
-                        });
-                        let cps = cps
-                            .iter()
-                            .rev()
-                            .map(|(x, s)| {
-                                print!("{s} ");
-                                *x
-                            })
-                            .collect::<Vec<_>>();
-                        println!();
-                        self.cutpoints.push(Series::new(feature.clone(), cps));
-                    }
-                    DataType::String => {
-                        self.cutpoints.push(
-                            col_y
-                                .drop_in_place(feature)?
-                                .unique()?
-                                .cast(&DataType::String)?,
-                        );
-                    }
-                    //DataType::Date
-                    //| DataType::Datetime(_, _)
-                    //| DataType::Duration(_)
-                    //| DataType::Time => todo!(),
-                    _ => continue,
                 }
-                //if dtype.is_numeric() && a >= self.nominal_size {
-                //    //let mut cutpoints = Series::new(*feature, []);
-                //    let mut running_counts = vec![0u128; unique_labels.len()];
-                //    col_y = col_y.sort([feature.to_string()], SortMultipleOptions::default())?;
-                //    let mut cps = Vec::new();
-                //    let sorted = col_y.drop_in_place(feature.as_ref())?;
-                //    let labels = col_y.drop_in_place(y.name().as_ref())?;
-                //    let mut prev_label = labels.get(0)?;
-                //    let mut prev_value = sorted.get(0)?;
-                //    running_counts[labels.iter().position(|x| x == prev_label).unwrap()] += 1;
-                //    for (s, l) in sorted.iter().zip(labels.iter()).skip(1) {
-                //        let score = Self::score(&running_counts, &label_counts);
-                //        running_counts[unique_labels.iter().position(|x| x == l).unwrap()] += 1;
-                //        if prev_label != l && prev_value != s {
-                //            if score >= threshold {
-                //                cps.push((
-                //                    Series::new("tmp".into(), [s.clone(), prev_value.clone()])
-                //                        .mean()
-                //                        .unwrap(),
-                //                    score,
-                //                ));
-                //            }
-                //            prev_value = s;
-                //            prev_label = l;
-                //        }
-                //    }
-                //    cps.sort_by(|(_, a), (_, b)| {
-                //        if a.is_nan() {
-                //            Ordering::Greater
-                //        } else if b.is_nan() {
-                //            Ordering::Less
-                //        } else {
-                //            a.partial_cmp(b).unwrap()
-                //        }
-                //    });
-                //    let cps = cps
-                //        .iter()
-                //        .rev()
-                //        .map(|(x, s)| {
-                //            print!("{s} ");
-                //            *x
-                //        })
-                //        .collect::<Vec<_>>();
-                //    println!();
-                //    self.cutpoints.push(Series::new(feature.clone(), cps));
-                //} else {
-                //    self.cutpoints.push(
-                //        col_y
-                //            .drop_in_place(feature)?
-                //            .unique()?
-                //            .cast(&DataType::String)?,
-                //    );
-                //}
+                cps.sort_by(|(_, a), (_, b)| {
+                    if a.is_nan() {
+                        Ordering::Greater
+                    } else if b.is_nan() {
+                        Ordering::Less
+                    } else {
+                        a.partial_cmp(b).unwrap()
+                    }
+                });
+                let cps = cps
+                    .iter()
+                    .rev()
+                    .map(|(x, s)| {
+                        print!("{s} ");
+                        x.clone()
+                    })
+                    .collect::<Vec<_>>();
+                println!();
+                self.cutpoints.push(Series::new(feature_name.clone(), cps));
             }
         }
         Ok(())
@@ -345,7 +186,7 @@ impl Binarizer {
 
         let x = sum - score;
 
-        let k = -2.0 + (2.0_f64).powi(runner.len() as i32 - 1);
+        let k = -2.0 + f64::from((2u32).pow(runner.len() as u32 - 1));
 
         x / k.mul_add(1.0 - x, 1.0)
     }
