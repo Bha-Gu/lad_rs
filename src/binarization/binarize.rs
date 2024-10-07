@@ -39,55 +39,91 @@ impl Binarizer {
     pub fn transform(&self, data: PyDataFrame) -> PyResult<PyDataFrame> {
         // Convert PyDataFrame into a Polars DataFrame
         let df: DataFrame = data.into();
-        println!("Debug0");
+        let schema = df.schema();
+
+        //println!("Debug0");
         let mut out = DataFrame::default();
-        // Check if cutpoints are available
-        if self.cutpoints.is_empty() {
-            return Err(PyErr::new::<PyRuntimeError, _>(
-                "Cutpoints not generated. Call 'generate_cutpoints' first.",
-            ));
-        }
 
-        println!("Debug1");
-
-        // Iterate over each feature (column) and apply corresponding cutpoints
-        for cutpoints in &self.cutpoints {
-            println!("Debug2");
-            let feature_name = cutpoints.name();
-            let dtype = cutpoints.dtype();
-            // Ensure the feature exists in the DataFrame
-            if let Ok(feature_series) = df.column(feature_name) {
-                for cp in cutpoints.iter() {
-                    let binarized_column = feature_series
-                        .iter()
-                        .map(|value| {
-                            if dtype.is_numeric() {
-                                if value >= cp {
-                                    true // Value is less than the cutpoint
-                                } else {
-                                    false // Value is greater than or equal to the cutpoint
-                                }
-                            } else {
-                                value == cp
-                            }
-                        })
-                        .collect::<Vec<_>>();
-
-                    match out.hstack_mut(&[Series::new(
-                        format!("{feature_name} on {cp}").into(),
-                        binarized_column,
-                    )]) {
-                        Ok(_) => (),
-                        Err(e) => return Err(PyErr::new::<PyRuntimeError, _>(e.to_string())),
-                    };
+        for (feature_name, data_type) in schema.iter() {
+            let column = df.column(feature_name).unwrap();
+            if data_type.is_bool() {
+                out.hstack_mut(&[column.clone()]).unwrap();
+                continue;
+            }
+            let a = column.n_unique().unwrap();
+            if a <= self.nominal_size || data_type.is_string() {
+                for value in column.unique_stable().unwrap().iter() {
+                    out.hstack_mut(&[Series::new(
+                        format!("{feature_name} = {value}").into(),
+                        column.iter().map(|x| x == value).collect::<Vec<_>>(),
+                    )])
+                    .unwrap();
+                }
+            } else if data_type.is_numeric() {
+                let cutpoints = self
+                    .cutpoints
+                    .iter()
+                    .find(|x| x.name() == feature_name)
+                    .unwrap();
+                for cutpoint in cutpoints.iter() {
+                    out.hstack_mut(&[Series::new(
+                        format!("{feature_name} > {cutpoint}").into(),
+                        column.iter().map(|x| x >= cutpoint).collect::<Vec<_>>(),
+                    )])
+                    .unwrap();
                 }
             } else {
-                // If feature is not found, raise an error
-                return Err(PyErr::new::<PyRuntimeError, _>(format!(
-                    "Feature '{feature_name}' not found in DataFrame"
-                )));
+                println!("{data_type} not supported yet. Skipping");
             }
         }
+
+        //// Check if cutpoints are available
+        //if self.cutpoints.is_empty() {
+        //    return Err(PyErr::new::<PyRuntimeError, _>(
+        //        "Cutpoints not generated. Call 'generate_cutpoints' first.",
+        //    ));
+        //}
+        //
+        //println!("Debug1");
+        //
+        //// Iterate over each feature (column) and apply corresponding cutpoints
+        //for cutpoints in &self.cutpoints {
+        //    println!("Debug2");
+        //    let feature_name = cutpoints.name();
+        //    let dtype = cutpoints.dtype();
+        //    // Ensure the feature exists in the DataFrame
+        //    if let Ok(feature_series) = df.column(feature_name) {
+        //        for cp in cutpoints.iter() {
+        //            let binarized_column = feature_series
+        //                .iter()
+        //                .map(|value| {
+        //                    if dtype.is_numeric() {
+        //                        if value >= cp {
+        //                            true // Value is less than the cutpoint
+        //                        } else {
+        //                            false // Value is greater than or equal to the cutpoint
+        //                        }
+        //                    } else {
+        //                        value == cp
+        //                    }
+        //                })
+        //                .collect::<Vec<_>>();
+        //
+        //            match out.hstack_mut(&[Series::new(
+        //                format!("{feature_name} on {cp}").into(),
+        //                binarized_column,
+        //            )]) {
+        //                Ok(_) => (),
+        //                Err(e) => return Err(PyErr::new::<PyRuntimeError, _>(e.to_string())),
+        //            };
+        //        }
+        //    } else {
+        //        // If feature is not found, raise an error
+        //        return Err(PyErr::new::<PyRuntimeError, _>(format!(
+        //            "Feature '{feature_name}' not found in DataFrame"
+        //        )));
+        //    }
+        //}
 
         // Convert the DataFrame back to PyDataFrame and return
         Ok(PyDataFrame(out))
