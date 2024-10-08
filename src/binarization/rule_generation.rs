@@ -6,6 +6,8 @@ use pyo3_polars::{PyDataFrame, PySeries};
 
 use super::binarize::Binarizer;
 
+type Pattern = HashSet<(bool, String)>;
+
 #[pyclass]
 pub struct RuleGenerator {
     bin: Binarizer,
@@ -30,6 +32,25 @@ impl RuleGenerator {
         self.rules.clone()
     }
 
+    pub fn predict(&self, data: PyDataFrame) -> Vec<Option<String>> {
+        // TO-DO change unwrap to pyerror
+        let data: DataFrame = self.bin.transform(&data.into()).unwrap();
+        let mut predictions: Vec<Option<String>> = vec![None; data.height()];
+
+        for (label, pattern) in &self.rules {
+            let coverage = self.coverage(&data, pattern);
+
+            // Iterate over each index in the coverage vector (a)
+            for (&is_covered, prediction) in coverage.iter().zip(predictions.iter_mut()) {
+                // If the current value is true and the result is None for this index, set the label
+                if is_covered && prediction.is_none() {
+                    *prediction = Some(label.clone()); // Use .clone() since label is a reference
+                }
+            }
+        }
+        predictions
+    }
+
     pub fn fit(&mut self, data: PyDataFrame, labels: PySeries) {
         //println!("Debug0");
         let df: DataFrame = data.into(); // Extract the Polars DataFrame
@@ -37,31 +58,13 @@ impl RuleGenerator {
         let features = df.get_column_names();
         // Ensure y is categorical or can be grouped
         let unique_y = y_series.unique_stable().unwrap();
-        self.labels = unique_y.iter().map(|x| format!("{x}")).collect();
+        self.labels = unique_y.iter().map(|x| x.to_string()).collect();
         // Initialize a Vec to hold the resulting DataFrames
-        let mut grouped_dfs: Vec<DataFrame> = Vec::new();
-
-        //println!("Debug1");
-        // Iterate through unique y values
-        for value in unique_y.iter() {
-            // Filter the DataFrame rows where y equals the current unique value
-            let mask = y_series.iter().map(|x| x == value).collect();
-            let sub_df = match df.filter(&mask) {
-                Ok(a) => a,
-                Err(e) => {
-                    eprintln!("{e:?}");
-                    continue;
-                }
-            };
-            // Add the resulting sub DataFrame to the Vec
-            grouped_dfs.push(sub_df);
-        }
-
+        let mut grouped_dfs: Vec<DataFrame> = self.divide_data(&df, &y_series);
         //println!("Debug2");
-        type Pattern = HashSet<(bool, String)>;
 
         // Perform further operations with grouped_dfs if necessary
-        let mut prime_patterns: Vec<(String, HashSet<(bool, String)>)> = Vec::new();
+        let mut prime_patterns: Vec<(String, Pattern)> = Vec::new();
         let mut prev_degree_patterns: Vec<Pattern> = vec![HashSet::new()];
 
         if self.max > features.len() || self.max == 0 {
@@ -91,30 +94,16 @@ impl RuleGenerator {
                         if should_break {
                             continue;
                         }
-                        let mask = |x: &DataFrame| -> Vec<bool> {
-                            let a = next_pattern
-                                .iter()
-                                .map(|(v, c)| {
-                                    x.column(c)
-                                        .unwrap()
-                                        .iter()
-                                        .map(|val| {
-                                            //println!("{val} = {v}");
-                                            val.cast(&DataType::Boolean).eq(&AnyValue::Boolean(*v))
-                                        })
-                                        .collect::<Vec<bool>>()
-                                })
-                                .collect::<Vec<_>>();
-                            let inner_length = a[0].len(); // Assuming all inner Vecs have the same length
-                            (0..inner_length)
-                                .map(|i| a.iter().all(|inner| inner[i]))
-                                .collect()
-                        };
                         let shapes = grouped_dfs.iter().map(DataFrame::shape).collect::<Vec<_>>();
                         //println!("{shapes:?}");
                         let counts: Vec<_> = grouped_dfs
                             .iter()
-                            .map(|x| x.filter(&mask(x).into_iter().collect()).unwrap().shape().0)
+                            .map(|x| {
+                                x.filter(&self.coverage(x, &next_pattern).into_iter().collect())
+                                    .unwrap()
+                                    .shape()
+                                    .0
+                            })
                             .collect();
                         let tmp = counts.iter().map(|x| usize::from(*x >= 1)).sum::<usize>();
 
@@ -128,7 +117,11 @@ impl RuleGenerator {
                                 //println!("{i}");
                                 grouped_dfs[i] = grouped_dfs[i]
                                     .filter(
-                                        &mask(&grouped_dfs[i]).into_iter().map(|x| !x).collect(),
+                                        &self
+                                            .coverage(&grouped_dfs[i], &next_pattern)
+                                            .into_iter()
+                                            .map(|x| !x)
+                                            .collect(),
                                     )
                                     .unwrap();
 
@@ -156,5 +149,50 @@ impl RuleGenerator {
         }
 
         self.rules = prime_patterns;
+    }
+}
+
+impl RuleGenerator {
+    fn coverage(&self, data: &DataFrame, pattern: &Pattern) -> Vec<bool> {
+        let a = pattern
+            .iter()
+            .map(|(v, c)| {
+                data.column(c)
+                    .unwrap()
+                    .iter()
+                    .map(|val| {
+                        //println!("{val} = {v}");
+                        val.cast(&DataType::Boolean).eq(&AnyValue::Boolean(*v))
+                    })
+                    .collect::<Vec<bool>>()
+            })
+            .collect::<Vec<_>>();
+        let inner_length = a[0].len(); // Assuming all inner Vecs have the same length
+        (0..inner_length)
+            .map(|i| a.iter().all(|inner| inner[i]))
+            .collect()
+    }
+
+    fn divide_data(&self, data: &DataFrame, labels: &Series) -> Vec<DataFrame> {
+        let mut grouped_dfs: Vec<DataFrame> = Vec::new();
+
+        let unique_y = self.labels.clone();
+
+        //println!("Debug1");
+        // Iterate through unique y values
+        for value in &unique_y {
+            // Filter the DataFrame rows where y equals the current unique value
+            let mask = labels.iter().map(|x| x.to_string() == *value).collect();
+            let sub_df = match data.filter(&mask) {
+                Ok(a) => a,
+                Err(e) => {
+                    eprintln!("{e:?}");
+                    continue;
+                }
+            };
+            // Add the resulting sub DataFrame to the Vec
+            grouped_dfs.push(sub_df);
+        }
+        grouped_dfs
     }
 }

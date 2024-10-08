@@ -36,97 +36,12 @@ impl Binarizer {
         }
     }
 
-    pub fn transform(&self, data: PyDataFrame) -> PyResult<PyDataFrame> {
-        // Convert PyDataFrame into a Polars DataFrame
-        let df: DataFrame = data.into();
-        let schema = df.schema();
-
-        //println!("Debug0");
-        let mut out = DataFrame::default();
-
-        for (feature_name, data_type) in schema.iter() {
-            let column = df.column(feature_name).unwrap();
-            if data_type.is_bool() {
-                out.hstack_mut(&[column.clone()]).unwrap();
-                continue;
-            }
-            let a = column.n_unique().unwrap();
-            if a <= self.nominal_size || data_type.is_string() {
-                for value in column.unique_stable().unwrap().iter() {
-                    out.hstack_mut(&[Series::new(
-                        format!("{feature_name} = {value}").into(),
-                        column.iter().map(|x| x == value).collect::<Vec<_>>(),
-                    )])
-                    .unwrap();
-                }
-            } else if data_type.is_numeric() {
-                let cutpoints = self
-                    .cutpoints
-                    .iter()
-                    .find(|x| x.name() == feature_name)
-                    .unwrap();
-                for cutpoint in cutpoints.iter() {
-                    out.hstack_mut(&[Series::new(
-                        format!("{feature_name} > {cutpoint}").into(),
-                        column.iter().map(|x| x >= cutpoint).collect::<Vec<_>>(),
-                    )])
-                    .unwrap();
-                }
-            } else {
-                println!("{data_type} not supported yet. Skipping");
-            }
+    #[pyo3(name = "transform")]
+    pub fn transform_py(&self, data: PyDataFrame) -> PyResult<PyDataFrame> {
+        match self.transform(&data.into()) {
+            Ok(a) => Ok(PyDataFrame(a)),
+            Err(e) => Err(PyErr::new::<PyRuntimeError, _>(e.to_string())),
         }
-
-        //// Check if cutpoints are available
-        //if self.cutpoints.is_empty() {
-        //    return Err(PyErr::new::<PyRuntimeError, _>(
-        //        "Cutpoints not generated. Call 'generate_cutpoints' first.",
-        //    ));
-        //}
-        //
-        //println!("Debug1");
-        //
-        //// Iterate over each feature (column) and apply corresponding cutpoints
-        //for cutpoints in &self.cutpoints {
-        //    println!("Debug2");
-        //    let feature_name = cutpoints.name();
-        //    let dtype = cutpoints.dtype();
-        //    // Ensure the feature exists in the DataFrame
-        //    if let Ok(feature_series) = df.column(feature_name) {
-        //        for cp in cutpoints.iter() {
-        //            let binarized_column = feature_series
-        //                .iter()
-        //                .map(|value| {
-        //                    if dtype.is_numeric() {
-        //                        if value >= cp {
-        //                            true // Value is less than the cutpoint
-        //                        } else {
-        //                            false // Value is greater than or equal to the cutpoint
-        //                        }
-        //                    } else {
-        //                        value == cp
-        //                    }
-        //                })
-        //                .collect::<Vec<_>>();
-        //
-        //            match out.hstack_mut(&[Series::new(
-        //                format!("{feature_name} on {cp}").into(),
-        //                binarized_column,
-        //            )]) {
-        //                Ok(_) => (),
-        //                Err(e) => return Err(PyErr::new::<PyRuntimeError, _>(e.to_string())),
-        //            };
-        //        }
-        //    } else {
-        //        // If feature is not found, raise an error
-        //        return Err(PyErr::new::<PyRuntimeError, _>(format!(
-        //            "Feature '{feature_name}' not found in DataFrame"
-        //        )));
-        //    }
-        //}
-
-        // Convert the DataFrame back to PyDataFrame and return
-        Ok(PyDataFrame(out))
     }
 }
 
@@ -137,6 +52,14 @@ impl Binarizer {
         label: &Series,
         threshold: f64,
     ) -> Result<(), PolarsError> {
+        if data.shape().0 != label.len() {
+            println!(
+                "Lengths of data {} and label {} do not match",
+                data.shape().0,
+                label.len()
+            );
+            return Ok(());
+        }
         let schema = data.schema();
         self.cutpoints = Vec::new();
         let unique_labels = label.unique_stable()?;
@@ -152,7 +75,7 @@ impl Binarizer {
         let label_counts = label_counts;
         for (idx, (feature_name, data_type)) in schema.iter().enumerate() {
             let column = data[idx].clone();
-            let a = column.n_unique()?;
+            let a = column.n_unique().unwrap_or_default();
             if a <= self.nominal_size {
                 continue;
             }
@@ -166,18 +89,25 @@ impl Binarizer {
                 let labels = column_and_label.drop_in_place(label.name().as_ref())?;
                 let mut prev_label = labels.get(0)?;
                 let mut prev_value = sorted.get(0)?;
-                running_counts[labels.iter().position(|x| x == prev_label).unwrap()] += 1;
+                running_counts[unsafe {
+                    labels
+                        .iter()
+                        .position(|x| x == prev_label)
+                        .unwrap_unchecked()
+                }] += 1;
                 for (s, l) in sorted.iter().zip(labels.iter()).skip(1) {
                     let score = Self::score(&running_counts, &label_counts);
-                    running_counts[unique_labels.iter().position(|x| x == l).unwrap()] += 1;
+                    running_counts[unsafe {
+                        unique_labels.iter().position(|x| x == l).unwrap_unchecked()
+                    }] += 1;
                     if prev_label != l && prev_value != s {
                         if score >= threshold {
                             cps.push((
-                                AnyValue::from(
+                                AnyValue::from(unsafe {
                                     Series::new("tmp".into(), [s.clone(), prev_value.clone()])
                                         .mean()
-                                        .unwrap(),
-                                )
+                                        .unwrap_unchecked()
+                                })
                                 .cast(data_type),
                                 score,
                             ));
@@ -187,12 +117,14 @@ impl Binarizer {
                     }
                 }
                 cps.sort_by(|(_, a), (_, b)| {
-                    if a.is_nan() {
+                    if a.is_nan() && b.is_nan() {
+                        Ordering::Equal
+                    } else if a.is_nan() {
                         Ordering::Greater
                     } else if b.is_nan() {
                         Ordering::Less
                     } else {
-                        a.partial_cmp(b).unwrap()
+                        a.partial_cmp(b).unwrap_or(Ordering::Equal)
                     }
                 });
                 let cps = cps
@@ -210,7 +142,53 @@ impl Binarizer {
         Ok(())
     }
 
+    pub fn transform(&self, df: &DataFrame) -> PolarsResult<DataFrame> {
+        let schema = df.schema();
+
+        let mut out = DataFrame::default();
+
+        for (feature_name, data_type) in schema.iter() {
+            let column = df.column(feature_name)?;
+            if data_type.is_bool() {
+                out.hstack_mut(&[column.clone()])?;
+                continue;
+            }
+            let a = column.n_unique()?;
+            if a == 2 {
+                for value in column.iter().take(1) {
+                    out.hstack_mut(&[Series::new(
+                        format!("{feature_name} = {value}").into(),
+                        column.iter().map(|x| x == value).collect::<Vec<_>>(),
+                    )])?;
+                }
+            } else if a <= self.nominal_size || data_type.is_string() {
+                for value in column.unique_stable()?.iter() {
+                    out.hstack_mut(&[Series::new(
+                        format!("{feature_name} = {value}").into(),
+                        column.iter().map(|x| x == value).collect::<Vec<_>>(),
+                    )])?;
+                }
+            } else if data_type.is_numeric() {
+                let Some(cutpoints) = self.cutpoints.iter().find(|x| x.name() == feature_name)
+                else {
+                    return Err(PolarsError::ColumnNotFound(format!("Cannot find numeric column {feature_name}.\nMake sure schema of input and output data is the same.").into()));
+                };
+                for cutpoint in cutpoints.iter() {
+                    out.hstack_mut(&[Series::new(
+                        format!("{feature_name} > {cutpoint}").into(),
+                        column.iter().map(|x| x > cutpoint).collect::<Vec<_>>(),
+                    )])?;
+                }
+            } else {
+                println!("{data_type} not supported yet. Skipping");
+            }
+        }
+
+        Ok(out)
+    }
+
     fn score(runner: &[u128], total: &[u128]) -> f64 {
+        #[allow(clippy::cast_precision_loss)]
         let rates = runner
             .iter()
             .zip(total.iter())
@@ -218,6 +196,7 @@ impl Binarizer {
             .collect::<Vec<_>>();
         let sum = rates.iter().sum::<f64>();
 
+        #[allow(clippy::cast_precision_loss)]
         let score = rates.iter().map(|x| x * (sum - x)).sum::<f64>() / (runner.len() - 1) as f64;
 
         let x = sum - score;
