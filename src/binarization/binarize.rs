@@ -1,56 +1,33 @@
 use std::cmp::Ordering;
 
 use polars::prelude::*;
-use pyo3::{exceptions::PyRuntimeError, prelude::*};
-use pyo3_polars::{PyDataFrame, PySeries};
 
 #[derive(Clone)]
-#[pyclass]
 pub struct Binarizer {
     cutpoints: Vec<Series>,
     threshold: f64,
     nominal_size: usize,
+    max_cutpoints: usize,
 }
 
-#[pymethods]
 impl Binarizer {
-    #[new]
-    #[pyo3(signature = (threshold, nominal_size=2))]
-    pub const fn new(threshold: f64, nominal_size: usize) -> Self {
+    pub const fn new(threshold: f64, nominal_size: usize, max_cutpoints_per_column: usize) -> Self {
         Self {
             cutpoints: Vec::new(),
             threshold,
             nominal_size,
+            max_cutpoints: max_cutpoints_per_column,
         }
     }
 
-    pub fn get_cutpoints(&self) -> Vec<PySeries> {
-        self.cutpoints.iter().map(|x| PySeries(x.clone())).collect()
+    pub fn get_cutpoints(&self) -> Vec<Series> {
+        self.cutpoints.clone()
     }
 
-    #[pyo3(name = "generate_cutpoints")]
-    pub fn generate_cutpoints_py(&mut self, data: PyDataFrame, label: PySeries) -> PyResult<()> {
-        match self.generate_cutpoints(&data.into(), &label.into(), self.threshold) {
-            Ok(a) => Ok(a),
-            Err(e) => Err(PyErr::new::<PyRuntimeError, _>(e.to_string())),
-        }
-    }
-
-    #[pyo3(name = "transform")]
-    pub fn transform_py(&self, data: PyDataFrame) -> PyResult<PyDataFrame> {
-        match self.transform(&data.into()) {
-            Ok(a) => Ok(PyDataFrame(a)),
-            Err(e) => Err(PyErr::new::<PyRuntimeError, _>(e.to_string())),
-        }
-    }
-}
-
-impl Binarizer {
     pub fn generate_cutpoints(
         &mut self,
         data: &DataFrame,
         label: &Series,
-        threshold: f64,
     ) -> Result<(), PolarsError> {
         if data.shape().0 != label.len() {
             println!(
@@ -72,6 +49,7 @@ impl Binarizer {
                 }
             }
         }
+
         let label_counts = label_counts;
         for (idx, (feature_name, data_type)) in schema.iter().enumerate() {
             let column = data[idx].clone();
@@ -79,8 +57,8 @@ impl Binarizer {
             if a <= self.nominal_size {
                 continue;
             }
-            let mut column_and_label = DataFrame::new(vec![label.clone(), column])?;
             if data_type.is_numeric() {
+                let mut column_and_label = DataFrame::new(vec![label.clone(), column])?;
                 let mut running_counts = vec![0u128; unique_labels.len()];
                 column_and_label = column_and_label
                     .sort([feature_name.to_string()], SortMultipleOptions::default())?;
@@ -101,7 +79,7 @@ impl Binarizer {
                         unique_labels.iter().position(|x| x == l).unwrap_unchecked()
                     }] += 1;
                     if prev_label != l && prev_value != s {
-                        if score >= threshold {
+                        if score >= self.threshold {
                             cps.push((
                                 AnyValue::from(unsafe {
                                     Series::new("tmp".into(), [s.clone(), prev_value.clone()])
@@ -134,6 +112,7 @@ impl Binarizer {
                         print!("{s} ");
                         x.clone()
                     })
+                    .take(self.max_cutpoints)
                     .collect::<Vec<_>>();
                 println!();
                 self.cutpoints.push(Series::new(feature_name.clone(), cps));
@@ -154,7 +133,8 @@ impl Binarizer {
                 continue;
             }
             let a = column.n_unique()?;
-            if a == 2 {
+            if false {
+                // set to false to debug meant to be "a == 2"
                 for value in column.iter().take(1) {
                     out.hstack_mut(&[Series::new(
                         format!("{feature_name} = {value}").into(),
@@ -204,5 +184,35 @@ impl Binarizer {
         let k = -2.0 + f64::from((2u32).pow(runner.len() as u32 - 1));
 
         x / k.mul_add(1.0 - x, 1.0)
+    }
+
+    fn entropy(runner: &[u128], total: &[u128]) -> f64 {
+        // Calculate total counts
+        let total_count: u128 = total.iter().sum();
+
+        // Calculate probabilities
+        let probabilities: Vec<f64> = runner
+            .iter()
+            .map(|&r| {
+                if total_count > 0 {
+                    r as f64 / total_count as f64
+                } else {
+                    0.0
+                }
+            })
+            .collect();
+
+        let entropy_value: f64 = probabilities
+            .iter()
+            .filter_map(|&p| {
+                if p > 0.0 {
+                    Some(-p * p.log2()) // Using natural logarithm
+                } else {
+                    None
+                }
+            })
+            .sum();
+
+        entropy_value
     }
 }
