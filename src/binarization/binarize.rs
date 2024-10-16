@@ -54,7 +54,24 @@ impl Binarizer {
         for (idx, (feature_name, data_type)) in schema.iter().enumerate() {
             let column = data[idx].clone();
             let a = column.n_unique().unwrap_or_default();
-            if a <= self.nominal_size {
+            if a == 2 || data_type.is_bool() {
+                let unique_values = column.unique_stable()?;
+
+                self.cutpoints.push(Series::new(
+                    format!("Bool#{}", feature_name.clone()).into(),
+                    unique_values,
+                ));
+
+                continue;
+            }
+            if a <= self.nominal_size || data_type.is_string() {
+                let unique_values = column.unique_stable()?;
+
+                self.cutpoints.push(Series::new(
+                    format!("Nominal#{}", feature_name.clone()).into(),
+                    unique_values,
+                ));
+
                 continue;
             }
             if data_type.is_numeric() {
@@ -115,55 +132,66 @@ impl Binarizer {
                     .take(self.max_cutpoints)
                     .collect::<Vec<_>>();
                 println!();
-                self.cutpoints.push(Series::new(feature_name.clone(), cps));
+                self.cutpoints.push(Series::new(
+                    format!("Numeric#{}", feature_name.clone()).into(),
+                    cps,
+                ));
             }
         }
         Ok(())
     }
 
     pub fn transform(&self, df: &DataFrame) -> PolarsResult<DataFrame> {
-        let schema = df.schema();
-
         let mut out = DataFrame::default();
 
-        for (feature_name, data_type) in schema.iter() {
+        let names = self
+            .cutpoints
+            .iter()
+            .map(|x| (x.name().split_once('#').unwrap(), x));
+
+        for ((dtype, feature_name), col) in names {
             let column = df.column(feature_name)?;
-            if data_type.is_bool() {
-                out.hstack_mut(&[column.clone()])?;
+            if dtype == "Bool" {
+                let value = col.get(0).unwrap();
+                out.hstack_mut(&[Series::new(
+                    format!(
+                        "{feature_name} = {}",
+                        match value {
+                            AnyValue::String(a) => a.to_string(),
+                            _ => value.to_string(),
+                        }
+                    )
+                    .into(),
+                    column.iter().map(|x| x == value).collect::<Vec<_>>(),
+                )])?;
                 continue;
             }
-            let a = column.n_unique()?;
-            if false {
-                // set to false to debug meant to be "a == 2"
-                for value in column.iter().take(1) {
+            if dtype == "Nominal" {
+                for value in col.iter() {
                     out.hstack_mut(&[Series::new(
-                        format!("{feature_name} = {value}").into(),
+                        format!(
+                            "{feature_name} = {}",
+                            match value {
+                                AnyValue::String(a) => a.to_string(),
+                                _ => value.to_string(),
+                            }
+                        )
+                        .into(),
                         column.iter().map(|x| x == value).collect::<Vec<_>>(),
                     )])?;
                 }
-            } else if a <= self.nominal_size || data_type.is_string() {
-                for value in column.unique_stable()?.iter() {
-                    out.hstack_mut(&[Series::new(
-                        format!("{feature_name} = {value}").into(),
-                        column.iter().map(|x| x == value).collect::<Vec<_>>(),
-                    )])?;
-                }
-            } else if data_type.is_numeric() {
-                let Some(cutpoints) = self.cutpoints.iter().find(|x| x.name() == feature_name)
-                else {
-                    return Err(PolarsError::ColumnNotFound(format!("Cannot find numeric column {feature_name}.\nMake sure schema of input and output data is the same.").into()));
-                };
-                for cutpoint in cutpoints.iter() {
+            }
+            if dtype == "Numeric" {
+                for cutpoint in col.iter() {
                     out.hstack_mut(&[Series::new(
                         format!("{feature_name} > {cutpoint}").into(),
                         column.iter().map(|x| x > cutpoint).collect::<Vec<_>>(),
                     )])?;
                 }
             } else {
-                println!("{data_type} not supported yet. Skipping");
+                //println!("{data_type} not supported yet. Skipping");
             }
         }
-
         Ok(out)
     }
 
