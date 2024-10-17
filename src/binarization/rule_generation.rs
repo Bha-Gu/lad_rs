@@ -143,7 +143,7 @@ impl RuleGenerator {
                                         .collect(),
                                 )?;
 
-                                prime_patterns.push((i, next_pattern.clone()));
+                                prime_patterns.push((i, next_pattern));
 
                                 break;
                             }
@@ -211,11 +211,8 @@ impl RuleGenerator {
     fn divide_data(&self, data: &DataFrame, labels: &Series) -> Vec<DataFrame> {
         let mut grouped_dfs: Vec<DataFrame> = Vec::new();
 
-        let unique_y = self.labels.clone();
-
-        //println!("Debug1");
         // Iterate through unique y values
-        for value in unique_y.iter() {
+        for value in self.labels.iter() {
             // Filter the DataFrame rows where y equals the current unique value
             let mask = labels.iter().map(|x| x == value).collect();
             let sub_df = match data.filter(&mask) {

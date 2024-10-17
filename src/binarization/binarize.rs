@@ -60,7 +60,7 @@ impl Binarizer {
                 let unique_values = column.unique_stable()?;
 
                 self.cutpoints.push(Series::new(
-                    format!("Bool#{}", feature_name.clone()).into(),
+                    format!("Bool#{}", feature_name).into(),
                     unique_values,
                 ));
 
@@ -70,7 +70,7 @@ impl Binarizer {
                 let unique_values = column.unique_stable()?;
 
                 self.cutpoints.push(Series::new(
-                    format!("Nominal#{}", feature_name.clone()).into(),
+                    format!("Nominal#{}", feature_name).into(),
                     unique_values,
                 ));
 
@@ -101,7 +101,7 @@ impl Binarizer {
                         if score >= self.threshold {
                             cps.push((
                                 AnyValue::from(unsafe {
-                                    Series::new("tmp".into(), [s.clone(), prev_value.clone()])
+                                    Series::new("tmp".into(), [s.clone(), prev_value])
                                         .mean()
                                         .unwrap_unchecked()
                                 })
@@ -129,15 +129,13 @@ impl Binarizer {
                     .rev()
                     .map(|(x, s)| {
                         print!("{s} ");
-                        x.clone()
+                        x.to_owned()
                     })
                     .take(self.max_cutpoints)
                     .collect::<Vec<_>>();
                 println!();
-                self.cutpoints.push(Series::new(
-                    format!("Numeric#{}", feature_name.clone()).into(),
-                    cps,
-                ));
+                self.cutpoints
+                    .push(Series::new(format!("Numeric#{}", feature_name).into(), cps));
             }
         }
         Ok(())
