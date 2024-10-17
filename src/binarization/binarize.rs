@@ -11,6 +11,7 @@ pub struct Binarizer {
 }
 
 impl Binarizer {
+    #[must_use]
     pub const fn new(threshold: f64, nominal_size: usize, max_cutpoints_per_column: usize) -> Self {
         Self {
             cutpoints: Vec::new(),
@@ -20,6 +21,7 @@ impl Binarizer {
         }
     }
 
+    #[must_use]
     pub fn get_cutpoints(&self) -> Vec<Series> {
         self.cutpoints.clone()
     }

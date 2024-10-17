@@ -16,6 +16,7 @@ pub struct RuleGenerator {
 }
 
 impl RuleGenerator {
+    #[must_use]
     pub fn new(bin: &Binarizer, max: usize) -> Self {
         Self {
             bin: bin.clone(),
@@ -26,6 +27,7 @@ impl RuleGenerator {
         }
     }
 
+    #[must_use]
     pub fn get_rules(&self) -> Vec<(usize, HashSet<(bool, String)>)> {
         self.rules.clone()
     }
@@ -56,9 +58,8 @@ impl RuleGenerator {
                             self.labels
                                 .get(self.fallback_label)
                                 .unwrap_or(AnyValue::Null)
-                                .clone()
                         },
-                        |x| self.labels.get(*x).unwrap_or(AnyValue::Null).clone(),
+                        |x| self.labels.get(*x).unwrap_or(AnyValue::Null),
                     )
                 })
                 .collect::<Vec<_>>(),
@@ -185,7 +186,7 @@ impl RuleGenerator {
         let pattern_iter = pattern.iter();
 
         // Initialize a boolean mask for coverage with all true values
-        let mut mask: Option<Vec<bool>> = None;
+        let mut mask = vec![true; data.height()]; // Start with all true values
 
         // Iterate over each pattern element (value and column name)
         for (term, col_name) in pattern_iter {
@@ -199,20 +200,12 @@ impl RuleGenerator {
                 .collect::<Vec<bool>>();
 
             // If it's the first iteration, set the mask to the current one
-            if mask.is_none() {
-                mask = Some(current_mask);
-            } else {
-                // Combine with previous mask (element-wise AND operation)
-                mask = mask.map(|x| {
-                    x.iter()
-                        .zip(current_mask.iter())
-                        .map(|(a, b)| *a && *b)
-                        .collect::<Vec<_>>()
-                });
-            }
+            mask.iter_mut()
+                .zip(current_mask)
+                .for_each(|(a, b)| *a = *a && b);
         }
 
-        Ok(mask.unwrap_or_else(|| vec![true; data.height()])) // If no patterns, return full coverage (all true)
+        Ok(mask) // If no patterns, return full coverage (all true)
     }
 
     fn divide_data(&self, data: &DataFrame, labels: &Series) -> Vec<DataFrame> {
