@@ -87,7 +87,7 @@ impl Binarizer {
                 let mut prev_label = labels.get(0)?;
                 let mut prev_value = sorted.get(0)?;
                 running_counts[unsafe {
-                    labels
+                    unique_labels
                         .iter()
                         .position(|x| x == prev_label)
                         .unwrap_unchecked()
@@ -113,25 +113,31 @@ impl Binarizer {
                         prev_label = l;
                     }
                 }
-                cps.sort_by(|(_, a), (_, b)| {
-                    if a.is_nan() && b.is_nan() {
-                        Ordering::Equal
-                    } else if a.is_nan() {
-                        Ordering::Greater
-                    } else if b.is_nan() {
-                        Ordering::Less
-                    } else {
-                        a.partial_cmp(b).unwrap_or(Ordering::Equal)
-                    }
-                });
+
+                cps = cps
+                    .windows(3) // Use sliding window to check local maxima
+                    .filter_map(|window| {
+                        let (_x1, s1) = &window[0];
+                        let (x2, s2) = &window[1];
+                        let (_x3, s3) = &window[2];
+
+                        if s2 > s1 && s2 > s3 {
+                            Some((x2.clone(), *s2)) // Local maximum found
+                        } else {
+                            None
+                        }
+                    })
+                    .collect();
+
+                cps.sort_by(|(_, a), (_, b)| a.partial_cmp(b).unwrap_or(Ordering::Equal));
                 let cps = cps
                     .iter()
                     .rev()
+                    .take(self.max_cutpoints)
                     .map(|(x, s)| {
                         print!("{s} ");
                         x.to_owned()
                     })
-                    .take(self.max_cutpoints)
                     .collect::<Vec<_>>();
                 println!();
                 self.cutpoints
@@ -216,7 +222,9 @@ impl Binarizer {
 
         let len = len as f64;
 
-        2. * out / (len * (len - 1.))
+        let max = (len * len - (rates.len() % 2) as f64) / 4.;
+
+        f64::sqrt(out / max)
 
         //let sum = rates.iter().sum::<f64>();
         //
