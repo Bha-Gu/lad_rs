@@ -126,18 +126,16 @@ impl RuleGenerator {
                             continue;
                         }
 
-                        let valid_pattern = next_pattern.iter().all(|t| {
-                            let mut test_pattern = next_pattern.clone();
-                            test_pattern.remove(t);
-                            prev_degree_patterns.contains(&test_pattern)
-                        });
-
-                        if !valid_pattern {
+                        if next_pattern.iter().any(|t| {
+                            let test_pattern: HashSet<_> =
+                                next_pattern.iter().filter(|&x| *x != *t).cloned().collect();
+                            !prev_degree_patterns.contains(&test_pattern)
+                        }) {
                             continue;
                         }
 
                         let counts: Vec<usize> = grouped_dfs
-                            .par_iter()
+                            .iter()
                             .map(|df| -> PolarsResult<_> {
                                 Ok(self
                                     .coverage(df, &next_pattern)?
@@ -147,7 +145,7 @@ impl RuleGenerator {
                             })
                             .collect::<PolarsResult<Vec<_>>>()?;
 
-                        let tmp = counts.iter().filter(|&&x| x >= 1).count();
+                        let tmp = counts.iter().fold(0, |acc, &x| acc + (x >= 1) as usize);
 
                         if tmp == 1 {
                             for (i, &count) in counts.iter().enumerate() {
