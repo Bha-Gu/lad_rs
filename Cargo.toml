@@ -10,6 +10,7 @@ edition = "2021"
 
 [dependencies]
 itertools = "0.13.0"
+notify-rust = "4.11.3"
 polars = "0.43.1"
 polars-plan = "0.43.1"
 rayon = "1.10.0"

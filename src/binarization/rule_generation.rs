@@ -4,6 +4,10 @@ use super::binarize::Binarizer;
 use polars::prelude::*;
 use std::time::Instant;
 
+use rayon::prelude::*;
+
+use notify_rust::Notification;
+
 type Pattern = HashSet<(bool, String)>;
 
 #[derive(Clone)]
@@ -90,6 +94,12 @@ impl RuleGenerator {
             self.max
         };
 
+        let mut handle = Notification::new()
+            .summary("Task Progress")
+            .body("Task is starting")
+            .show()
+            .unwrap();
+
         for d in 1..=max_features {
             println!("{d}");
             let start_time = Instant::now();
@@ -98,7 +108,17 @@ impl RuleGenerator {
             let remaining_shapes: Vec<_> = grouped_dfs.iter().map(|df| df.shape().0).collect();
             println!("{remaining_shapes:?}");
 
-            for curr_pattern in &prev_degree_patterns {
+            for (pattern_idx, curr_pattern) in prev_degree_patterns.iter().enumerate() {
+                // Send notification for pattern progress
+                handle.body(&format!(
+                    "Processing pattern: {}/{} at depth {}",
+                    pattern_idx + 1,
+                    prev_degree_patterns.len(),
+                    d
+                ));
+
+                handle.update();
+
                 for feature in &features {
                     for term in [true, false] {
                         let mut next_pattern = curr_pattern.clone();
@@ -117,7 +137,7 @@ impl RuleGenerator {
                         }
 
                         let counts: Vec<usize> = grouped_dfs
-                            .iter()
+                            .par_iter()
                             .map(|df| -> PolarsResult<_> {
                                 Ok(self
                                     .coverage(df, &next_pattern)?
