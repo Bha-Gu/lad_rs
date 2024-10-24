@@ -8,15 +8,16 @@ use rayon::prelude::*;
 
 use notify_rust::Notification;
 
-type Pattern = HashSet<(bool, String)>;
+type Pattern = HashSet<(bool, usize)>;
 
 #[derive(Clone)]
 pub struct RuleGenerator {
     bin: Binarizer,
     max: usize,
-    rules: Vec<(usize, HashSet<(bool, String)>)>,
+    rules: Vec<(usize, HashSet<(bool, usize)>, usize)>,
     labels: Series,
     fallback_label: usize,
+    features: Vec<String>,
 }
 
 impl RuleGenerator {
@@ -28,30 +29,65 @@ impl RuleGenerator {
             rules: Vec::new(),
             labels: Series::new("tmp".into(), [0]),
             fallback_label: 0,
+            features: Vec::new(),
         }
     }
 
     #[must_use]
-    pub fn get_rules(&self) -> Vec<(usize, HashSet<(bool, String)>)> {
-        self.rules.clone()
+    pub fn get_rules(&self) -> Vec<(usize, Vec<(bool, String)>)> {
+        self.rules
+            .iter()
+            .map(|(a, x, _)| {
+                (
+                    *a,
+                    x.iter()
+                        .map(|(b, i)| (*b, self.features[*i].clone()))
+                        .collect(),
+                )
+            })
+            .collect()
     }
 
     pub fn predict(&self, data: &DataFrame) -> PolarsResult<Series> {
         let data: DataFrame = self.bin.transform(data)?;
         let mut predictions: Vec<Option<usize>> = vec![None; data.height()];
 
-        for (label, pattern) in &self.rules {
-            let coverage = self.coverage(&data, pattern);
+        let mut confidence = vec![vec![0.0_f64; self.labels.len()]; data.height()];
+
+        for (label, pattern, size) in &self.rules {
+            let coverage = self.par_coverage(&data, pattern);
 
             // Iterate over each index in the coverage vector (a)
-            for (&is_covered, prediction) in coverage?.iter().zip(predictions.iter_mut()) {
-                // If the current value is true and the result is None for this index, set the label
-                if is_covered && prediction.is_none() {
-                    *prediction = Some(*label); // Use .clone() since label is a reference
+            for (&is_covered, (prediction, conf)) in coverage?
+                .iter()
+                .zip(predictions.iter_mut().zip(confidence.iter_mut()))
+            {
+                if prediction.is_none() {
+                    if is_covered == 1. {
+                        *prediction = Some(*label);
+                    }
+                    conf[*label] = (conf[*label]) + is_covered * (*size) as f64;
                 }
             }
         }
-        //todo!();
+
+        predictions
+            .iter_mut()
+            .zip(confidence.iter())
+            .map(|(a, b)| {
+                let arg_max = b
+                    .iter()
+                    .enumerate()
+                    .max_by(|(_, val1), (_, val2)| val1.partial_cmp(val2).unwrap())
+                    .map(|(index, _)| index);
+                (a, arg_max)
+            })
+            .for_each(|(a, b)| {
+                if a.is_none() {
+                    *a = b; // Update with Some(index of max value)
+                }
+            });
+
         Ok(Series::new(
             "Predictions".into(),
             predictions
@@ -72,21 +108,17 @@ impl RuleGenerator {
 
     pub fn fit(&mut self, data: &DataFrame, labels: &Series) -> PolarsResult<()> {
         let features = data.get_column_names();
-        let unique_y = labels.unique_stable()?;
-        self.labels = unique_y;
+        self.features = features.iter().map(|&x| x.to_string()).collect();
+        self.labels = labels.unique_stable()?;
 
         // Divide data into groups based on the labels
         let mut grouped_dfs: Vec<DataFrame> = self.divide_data(data, labels);
-
         self.fallback_label = grouped_dfs
             .iter()
             .enumerate()
             .max_by_key(|(_, df)| df.shape().0)
             .map(|(i, _)| i)
             .unwrap_or_default();
-
-        let mut prime_patterns: Vec<(usize, Pattern)> = Vec::new();
-        let mut prev_degree_patterns: Vec<Pattern> = vec![HashSet::new()];
 
         let max_features = if self.max > features.len() || self.max == 0 {
             features.len()
@@ -100,6 +132,10 @@ impl RuleGenerator {
             .show()
             .unwrap();
 
+        let mut prev_degree_patterns: Vec<Pattern> = vec![HashSet::new()];
+
+        let mut prime_patterns: Vec<(usize, Pattern, usize)> = Vec::new();
+
         for d in 1..=max_features {
             println!("{d}");
             let start_time = Instant::now();
@@ -108,62 +144,58 @@ impl RuleGenerator {
             let remaining_shapes: Vec<_> = grouped_dfs.iter().map(|df| df.shape().0).collect();
             println!("{remaining_shapes:?}");
 
-            for (pattern_idx, curr_pattern) in prev_degree_patterns.iter().enumerate() {
-                // Send notification for pattern progress
+            let length = prev_degree_patterns.len();
+
+            for (pattern_idx, curr_pattern) in prev_degree_patterns.into_iter().enumerate() {
+                // Update notification for pattern progress
                 handle.body(&format!(
-                    "Processing pattern: {}/{} at depth {}",
+                    "processing pattern: {}/{} at depth {}",
                     pattern_idx + 1,
-                    prev_degree_patterns.len(),
+                    length,
                     d
                 ));
-
                 handle.update();
 
-                for feature in &features {
-                    for term in [true, false] {
+                for idx in 0..features.len() {
+                    for &term in &[true, false] {
                         let mut next_pattern = curr_pattern.clone();
-                        if !next_pattern.insert((term, feature.to_string())) {
-                            continue;
+                        if !next_pattern.insert((term, idx)) {
+                            continue; // Skip if pattern already exists
                         }
+                        //
+                        //// Check if the next pattern is a valid extension
+                        //if next_pattern.par_iter().any(|t| {
+                        //    let test_pattern: HashSet<_> =
+                        //        next_pattern.iter().filter(|&&x| x != *t).cloned().collect();
+                        //    !prev_degree_patterns.contains(&test_pattern)
+                        //}) {
+                        //    continue;
+                        //}
 
-                        if next_pattern.iter().any(|t| {
-                            let test_pattern: HashSet<_> =
-                                next_pattern.iter().filter(|&x| *x != *t).cloned().collect();
-                            !prev_degree_patterns.contains(&test_pattern)
-                        }) {
-                            continue;
-                        }
-
+                        // Compute counts in parallel
                         let counts: Vec<usize> = grouped_dfs
-                            .iter()
-                            .map(|df| -> PolarsResult<_> {
-                                Ok(self
-                                    .coverage(df, &next_pattern)?
-                                    .into_iter()
-                                    .filter(|&x| x)
-                                    .count())
+                            .par_iter()
+                            .map(|df| {
+                                self.coverage(df, &next_pattern)
+                                    .map(|mask| mask.into_iter().filter(|&x| x).count())
                             })
                             .collect::<PolarsResult<Vec<_>>>()?;
 
-                        let tmp = counts.iter().fold(0, |acc, &x| acc + (x >= 1) as usize);
+                        let tmp = counts.iter().filter(|&&x| x >= 1).count();
 
                         if tmp == 1 {
-                            for (i, &count) in counts.iter().enumerate() {
+                            for (i, count) in counts.into_iter().enumerate() {
                                 if count == 0 || grouped_dfs[i].shape().0 == 0 {
                                     continue;
                                 }
 
-                                grouped_dfs[i] = grouped_dfs[i].filter(
-                                    &self
-                                        .coverage(&grouped_dfs[i], &next_pattern)?
-                                        .into_iter()
-                                        .map(|x| !x)
-                                        .collect(),
-                                )?;
+                                // Filter the DataFrame based on the coverage mask
+                                let mask = self.coverage(&grouped_dfs[i], &next_pattern)?;
+                                grouped_dfs[i] = grouped_dfs[i]
+                                    .filter(&mask.into_iter().map(|x| !x).collect())?;
 
-                                prime_patterns.push((i, next_pattern));
-
-                                break;
+                                prime_patterns.push((i, next_pattern, count));
+                                break; // Break after first match
                             }
                         } else if tmp != 0 {
                             curr_degree_patterns.push(next_pattern);
@@ -172,9 +204,73 @@ impl RuleGenerator {
                 }
             }
 
+            loop {
+                let mut max_score_at = ((0, 0), 0);
+
+                for i in (0..curr_degree_patterns.len()).rev() {
+                    let pattern = &curr_degree_patterns[i];
+                    handle.body(&format!(
+                        "processing best pattern: {}/{} at depth {}, max: {}",
+                        curr_degree_patterns.len() - i,
+                        curr_degree_patterns.len(),
+                        d,
+                        max_score_at.0 .1
+                    ));
+                    handle.update();
+
+                    let counts: Vec<usize> = grouped_dfs
+                        .par_iter()
+                        .map(|df| {
+                            self.coverage(df, &pattern)
+                                .map(|mask| mask.into_iter().filter(|&x| x).count())
+                        })
+                        .collect::<PolarsResult<Vec<_>>>()?;
+
+                    let tmp = counts.iter().filter(|&&x| x >= 1).count();
+
+                    if tmp == 1 {
+                        let score1 = counts.iter().max().unwrap();
+
+                        max_score_at = (
+                            (counts.iter().position(|&x| x == *score1).unwrap(), *score1),
+                            i,
+                        );
+                        let mask = self.coverage(&grouped_dfs[max_score_at.0 .0], &pattern)?;
+                        grouped_dfs[max_score_at.0 .0] = grouped_dfs[max_score_at.0 .0]
+                            .filter(&mask.into_iter().map(|x| !x).collect())?;
+                        prime_patterns.push((
+                            max_score_at.0 .0,
+                            curr_degree_patterns[max_score_at.1].clone(),
+                            *score1,
+                        ));
+                        curr_degree_patterns.swap_remove(i); // Remove the current pattern
+                    }
+                }
+
+                handle.body(&format!("Max Score: {} at depth {}", max_score_at.0 .1, d));
+                handle.update();
+
+                if max_score_at.0 .1 == 0 {
+                    break;
+                }
+                //let tmp = curr_degree_patterns[max_score_at.1].clone();
+                //
+                //let mask = self.coverage(&grouped_dfs[max_score_at.0 .0], &tmp)?;
+                //grouped_dfs[max_score_at.0 .0] = grouped_dfs[max_score_at.0 .0]
+                //    .filter(&mask.into_iter().map(|x| !x).collect())?;
+                //
+                //prime_patterns.push((
+                //    max_score_at.0 .0,
+                //    curr_degree_patterns[max_score_at.1].clone(),
+                //));
+                //
+                //curr_degree_patterns.retain(|idx| *idx != tmp);
+            }
+
             let duration = start_time.elapsed();
             println!("Time taken: {:.2} milliseconds", duration.as_millis());
 
+            // Check remaining shapes
             let remaining_shapes: Vec<_> = grouped_dfs.iter().map(|df| df.shape().0).collect();
             println!("{remaining_shapes:?}");
 
@@ -197,6 +293,135 @@ impl RuleGenerator {
         self.rules = prime_patterns;
         Ok(())
     }
+
+    //pub fn fit(&mut self, data: &DataFrame, labels: &Series) -> PolarsResult<()> {
+    //    let features = data.get_column_names();
+    //    self.features = features.iter().map(|&x| (*x).to_string()).collect();
+    //    let unique_y = labels.unique_stable()?;
+    //    self.labels = unique_y;
+    //
+    //    // Divide data into groups based on the labels
+    //    let mut grouped_dfs: Vec<DataFrame> = self.divide_data(data, labels);
+    //
+    //    self.fallback_label = grouped_dfs
+    //        .iter()
+    //        .enumerate()
+    //        .max_by_key(|(_, df)| df.shape().0)
+    //        .map(|(i, _)| i)
+    //        .unwrap_or_default();
+    //
+    //    let mut prime_patterns: Vec<(usize, Pattern)> = Vec::new();
+    //    let mut prev_degree_patterns: Vec<Pattern> = vec![HashSet::new()];
+    //
+    //    let max_features = if self.max > features.len() || self.max == 0 {
+    //        features.len()
+    //    } else {
+    //        self.max
+    //    };
+    //
+    //    let mut handle = Notification::new()
+    //        .summary("Task Progress")
+    //        .body("Task is starting")
+    //        .show()
+    //        .unwrap();
+    //
+    //    for d in 1..=max_features {
+    //        println!("{d}");
+    //        let start_time = Instant::now();
+    //        let mut curr_degree_patterns = Vec::new();
+    //
+    //        let remaining_shapes: Vec<_> = grouped_dfs.iter().map(|df| df.shape().0).collect();
+    //        println!("{remaining_shapes:?}");
+    //
+    //        for (pattern_idx, curr_pattern) in prev_degree_patterns.iter().enumerate() {
+    //            // Send notification for pattern progress
+    //            handle.body(&format!(
+    //                "Processing pattern: {}/{} at depth {}",
+    //                pattern_idx + 1,
+    //                prev_degree_patterns.len(),
+    //                d
+    //            ));
+    //
+    //            handle.update();
+    //
+    //            for idx in 0..features.len() {
+    //                for term in [true, false] {
+    //                    let mut next_pattern = curr_pattern.clone();
+    //                    if !next_pattern.insert((term, idx)) {
+    //                        continue;
+    //                    }
+    //
+    //                    if next_pattern.par_iter().any(|t| {
+    //                        let test_pattern: HashSet<_> =
+    //                            next_pattern.iter().filter(|&x| *x != *t).cloned().collect();
+    //                        !prev_degree_patterns.contains(&test_pattern)
+    //                    }) {
+    //                        continue;
+    //                    }
+    //
+    //                    let counts: Vec<usize> = grouped_dfs
+    //                        .par_iter()
+    //                        .map(|df| -> PolarsResult<_> {
+    //                            Ok(self
+    //                                .coverage(df, &next_pattern)?
+    //                                .into_iter()
+    //                                .filter(|&x| x)
+    //                                .count())
+    //                        })
+    //                        .collect::<PolarsResult<Vec<_>>>()?;
+    //
+    //                    let tmp = counts.iter().fold(0, |acc, &x| acc + (x >= 1) as usize);
+    //
+    //                    if tmp == 1 {
+    //                        for (i, &count) in counts.iter().enumerate() {
+    //                            if count == 0 || grouped_dfs[i].shape().0 == 0 {
+    //                                continue;
+    //                            }
+    //
+    //                            grouped_dfs[i] = grouped_dfs[i].filter(
+    //                                &self
+    //                                    .coverage(&grouped_dfs[i], &next_pattern)?
+    //                                    .into_iter()
+    //                                    .map(|x| !x)
+    //                                    .collect(),
+    //                            )?;
+    //
+    //                            prime_patterns.push((i, next_pattern));
+    //
+    //                            break;
+    //                        }
+    //                    } else if tmp != 0 {
+    //                        curr_degree_patterns.push(next_pattern);
+    //                    }
+    //                }
+    //            }
+    //        }
+    //
+    //                  let duration = start_time.elapsed();
+    //        println!("Time taken: {:.2} milliseconds", duration.as_millis());
+    //
+    //        let remaining_shapes: Vec<_> = grouped_dfs.iter().map(|df| df.shape().0).collect();
+    //        println!("{remaining_shapes:?}");
+    //
+    //        if remaining_shapes.iter().sum::<usize>() == 0 {
+    //            break;
+    //        }
+    //
+    //        if d == max_features {
+    //            self.fallback_label = grouped_dfs
+    //                .iter()
+    //                .enumerate()
+    //                .max_by_key(|(_, df)| df.shape().0)
+    //                .map(|(i, _)| i)
+    //                .unwrap_or_default();
+    //        }
+    //
+    //        prev_degree_patterns = curr_degree_patterns;
+    //    }
+    //
+    //    self.rules = prime_patterns;
+    //    Ok(())
+    //}
 }
 
 impl RuleGenerator {
@@ -208,14 +433,13 @@ impl RuleGenerator {
 
         // Iterate over each pattern element (value and column name)
         for (term, col_name) in pattern_iter {
-            let col = data.column(col_name)?;
+            let col = data.column(&self.features[*col_name])?;
 
             // Create a boolean mask for the current column by comparing its values with the pattern term
             let current_mask = col
                 .bool()?
                 .into_iter()
-                .map(|val| val.unwrap_or(false) == *term) // Replace any None with false
-                .collect::<Vec<bool>>();
+                .map(|val| val.unwrap_or(false) == *term);
 
             // If it's the first iteration, set the mask to the current one
             mask.iter_mut()
@@ -224,6 +448,42 @@ impl RuleGenerator {
         }
 
         Ok(mask) // If no patterns, return full coverage (all true)
+    }
+
+    fn par_coverage(&self, data: &DataFrame, pattern: &Pattern) -> PolarsResult<Vec<f64>> {
+        let pattern_iter = pattern.into_iter();
+
+        // Initialize a boolean mask for coverage with all true values
+        let mut mask = vec![0.; data.height()]; // Start with all true values
+
+        let mut len = 0.;
+        // Iterate over each pattern element (value and column name)
+        for (term, col_name) in pattern_iter {
+            len += 1.;
+
+            let col = data.column(&self.features[*col_name])?;
+
+            // Create a boolean mask for the current column by comparing its values with the pattern term
+            let current_mask = col
+                .bool()?
+                .into_iter()
+                .map(|val| val.unwrap_or(false) == *term);
+
+            // If it's the first iteration, set the mask to the current one
+            mask.iter_mut().zip(current_mask).for_each(|(a, b)| {
+                if b {
+                    *a = *a + 1.
+                }
+            });
+        }
+
+        mask.iter_mut().for_each(|a| {
+            if len != 0. {
+                *a = *a / len
+            }
+        });
+
+        Ok(mask)
     }
 
     fn divide_data(&self, data: &DataFrame, labels: &Series) -> Vec<DataFrame> {
