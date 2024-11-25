@@ -5,7 +5,7 @@ use polars::prelude::*;
 #[derive(Clone)]
 pub struct Binarizer {
     cutpoints: Vec<Series>,
-    threshold: f64,
+    pub threshold: f64,
     nominal_size: usize,
     max_cutpoints: usize,
     depth: usize,
@@ -22,7 +22,7 @@ impl Binarizer {
         Self {
             cutpoints: Vec::new(),
             threshold,
-            nominal_size: nominal_size.max(2usize.saturating_pow(depth as u32)),
+            nominal_size,
             max_cutpoints: max_cutpoints_per_column,
             depth,
         }
@@ -120,7 +120,7 @@ impl Binarizer {
                         )? {
                             // Create two new segments based on the split point
                             new_segments.push((start, split_idx));
-                            new_segments.push((split_idx + 1, end));
+                            new_segments.push((split_idx, end));
                         }
                     }
 
@@ -128,54 +128,16 @@ impl Binarizer {
                     segments = new_segments;
                 }
 
-                //for (s, l) in sorted.iter().zip(labels.iter()).skip(1) {
-                //    let score = Self::score(&running_counts, &label_counts);
-                //    running_counts[unsafe {
-                //        unique_labels.iter().position(|x| x == l).unwrap_unchecked()
-                //    }] += 1;
-                //    if prev_label != l && prev_value != s {
-                //        if score >= self.threshold {
-                //            cps.push((
-                //                AnyValue::from(unsafe {
-                //                    Series::new("tmp".into(), [s.clone(), prev_value])
-                //                        .mean()
-                //                        .unwrap_unchecked()
-                //                })
-                //                .cast(data_type),
-                //                score,
-                //            ));
-                //        }
-                //        prev_value = s;
-                //        prev_label = l;
-                //    }
-                //}
-                //
-                //cps = cps
-                //    .windows(3)
-                //    .filter_map(|window| {
-                //        let (_x1, s1) = &window[0];
-                //        let (x2, s2) = &window[1];
-                //        let (_x3, s3) = &window[2];
-                //
-                //        if s2 > s1 && s2 > s3 {
-                //            Some((x2.clone(), *s2))
-                //        } else {
-                //            None
-                //        }
-                //    })
-                //    .collect();
-                //
-                //cps.sort_by(|(_, a), (_, b)| a.partial_cmp(b).unwrap_or(Ordering::Equal));
                 let cps = cps
                     .iter()
                     //.rev()
                     //.take(self.max_cutpoints)
-                    .map(|(x, s)| {
-                        print!("{s} ");
+                    .map(|(x, _s)| {
+                        //print!("{s} ");
                         x.to_owned()
                     })
                     .collect::<Vec<_>>();
-                println!();
+                //println!();
                 self.cutpoints
                     .push(Series::new(format!("Numeric#{}", feature_name).into(), cps));
             }
@@ -208,23 +170,8 @@ impl Binarizer {
                 )])?;
                 continue;
             }
-            // TODO: Add binary encoding using '''self.depth''' so instead of making n columns for n
-            // nominal values it makes ceil(log_2(n)) columns for n nominal values
+
             if dtype == "Nominal" {
-                //for value in col.iter() {
-                //    out.hstack_mut(&[Series::new(
-                //        format!(
-                //            "{feature_name} = {}",
-                //            match value {
-                //                AnyValue::String(a) => a.to_string(),
-                //                _ => value.to_string(),
-                //            }
-                //        )
-                //        .into(),
-                //        column.iter().map(|x| x == value).collect::<Vec<_>>(),
-                //    )])?;
-                //}
-                // Step 1: Determine unique values and required binary width
                 let unique_values: Vec<_> = col.iter().collect();
                 let n = unique_values.len();
                 let num_bits = (n as f64).log2().ceil() as usize;
@@ -255,11 +202,38 @@ impl Binarizer {
                 }
             }
             if dtype == "Numeric" {
-                for cutpoint in col.iter() {
-                    out.hstack_mut(&[Series::new(
-                        format!("{feature_name} > {cutpoint}").into(),
-                        column.iter().map(|x| x > cutpoint).collect::<Vec<_>>(),
-                    )])?;
+                if col.len() == 0 {
+                    continue;
+                }
+
+                let mut nominal_classes: Vec<usize> = Vec::new();
+                let col = col.sort(SortOptions::default())?;
+                for val in column.iter() {
+                    let a = col.iter().position(|cut| val <= cut).unwrap_or(col.len());
+                    nominal_classes.push(a);
+                }
+
+                // Step 2: Determine bit length needed for encoding classes
+                let n_classes = col.len() + 1; // One class for each cutpoint range, plus one for values above the last cutpoint
+                let num_bits = (n_classes as f64).log2().ceil() as usize;
+                // Step 3: Map each class to a binary code
+                let mut binary_map = HashMap::new();
+                for i in 0..n_classes {
+                    let binary_code: Vec<bool> =
+                        (0..num_bits).rev().map(|bit| (i >> bit) & 1 == 1).collect();
+                    binary_map.insert(i, binary_code);
+                }
+
+                // Step 4: Create binary columns for each bit position
+                for bit_pos in 0..num_bits {
+                    let column_name = format!("{}_bit_{}", feature_name, bit_pos);
+                    let bit_col: Vec<bool> = nominal_classes
+                        .iter()
+                        .map(|&class_idx| binary_map[&class_idx][bit_pos])
+                        .collect();
+
+                    // Add the bit column to the DataFrame
+                    out.hstack_mut(&[Series::new(column_name.into(), bit_col)])?;
                 }
             } else {
                 //println!("{data_type} not supported yet. Skipping");
@@ -278,6 +252,7 @@ impl Binarizer {
         data_type: &'a DataType,
         cps: &mut Vec<(AnyValue<'a>, f64)>,
     ) -> PolarsResult<Option<usize>> {
+        //println!("{start} {end}");
         let mut running_counts = vec![0u128; unique_labels.len()];
         let mut label_counts = vec![0u128; unique_labels.len()];
         for l in start..end {
@@ -288,6 +263,12 @@ impl Binarizer {
                 }
             }
         }
+
+        if start == end {
+            return Ok(None);
+        }
+
+        //println!("{sorted:?}\n{labels:?}");
 
         let label_counts = label_counts;
         let mut prev_label = labels.get(start)?;
@@ -312,10 +293,12 @@ impl Binarizer {
             .enumerate()
         {
             let score = Self::score(&running_counts, &label_counts);
+            //println!("{score:?} {best_score} {best_value:?} {best_index:?}");
             running_counts
                 [unsafe { unique_labels.iter().position(|x| x == l).unwrap_unchecked() }] += 1;
 
-            if prev_label != l && prev_value != s {
+            if prev_value != s {
+                //println!("inside  {score:?} {best_score} {prev_value} {s}");
                 if score >= self.threshold && score > best_score {
                     best_score = score;
                     best_value = Some(unsafe {
@@ -326,8 +309,9 @@ impl Binarizer {
                     best_index = Some(idx + start + 1);
                 }
                 prev_value = s;
-                prev_label = l;
             }
+
+            prev_label = l;
         }
 
         if let Some(value) = best_value {
@@ -337,7 +321,7 @@ impl Binarizer {
         Ok(best_index)
     }
 
-    fn score(runner: &[u128], total: &[u128]) -> f64 {
+    pub fn score(runner: &[u128], total: &[u128]) -> f64 {
         #[allow(clippy::cast_precision_loss)]
         let rates = runner
             .iter()
