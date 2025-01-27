@@ -54,6 +54,19 @@ impl RuleGenerator {
 
         let mut confidence = vec![vec![0.0_f64; self.labels.len()]; data.height()];
 
+        for (label, pattern, _) in &self.rules {
+            let coverage = self.coverage(&data, pattern);
+
+            // Iterate over each index in the coverage vector (a)
+            for (&is_covered, prediction) in coverage?.iter().zip(predictions.iter_mut()) {
+                if prediction.is_none() {
+                    if is_covered {
+                        *prediction = Some(*label);
+                    }
+                }
+            }
+        }
+
         for (label, pattern, size) in &self.rules {
             let coverage = self.par_coverage(&data, pattern);
 
@@ -66,7 +79,7 @@ impl RuleGenerator {
                     if is_covered == 1. {
                         *prediction = Some(*label);
                     }
-                    conf[*label] = (conf[*label]) + is_covered * (*size) as f64;
+                    conf[*label] += is_covered * (*size) as f64;
                 }
             }
         }
@@ -113,6 +126,9 @@ impl RuleGenerator {
 
         // Divide data into groups based on the labels
         let mut grouped_dfs: Vec<DataFrame> = self.divide_data(data, labels);
+
+        let base_shapes: Vec<_> = grouped_dfs.iter().map(|df| df.shape().0).collect();
+
         self.fallback_label = grouped_dfs
             .iter()
             .enumerate()
@@ -162,17 +178,7 @@ impl RuleGenerator {
                         if !next_pattern.insert((term, idx)) {
                             continue; // Skip if pattern already exists
                         }
-                        //
-                        //// Check if the next pattern is a valid extension
-                        //if next_pattern.par_iter().any(|t| {
-                        //    let test_pattern: HashSet<_> =
-                        //        next_pattern.iter().filter(|&&x| x != *t).cloned().collect();
-                        //    !prev_degree_patterns.contains(&test_pattern)
-                        //}) {
-                        //    continue;
-                        //}
 
-                        // Compute counts in parallel
                         let counts: Vec<usize> = grouped_dfs
                             .par_iter()
                             .map(|df| {
