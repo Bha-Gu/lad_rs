@@ -1,4 +1,4 @@
-use std::{cmp::Ordering, collections::HashMap};
+use std::collections::HashMap;
 
 use polars::prelude::*;
 
@@ -49,6 +49,7 @@ impl Binarizer {
         let schema = data.schema();
         self.cutpoints = Vec::new();
         let unique_labels = label.unique_stable()?;
+        println!("{unique_labels:?}");
         let mut label_counts = vec![0u128; unique_labels.len()];
         for l in label.iter() {
             for (j, lj) in unique_labels.iter().enumerate() {

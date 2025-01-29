@@ -1,4 +1,4 @@
-use std::collections::HashSet;
+use std::{collections::HashSet, f64::consts::E};
 
 use super::binarize::Binarizer;
 use polars::prelude::*;
@@ -14,17 +14,25 @@ type Pattern = HashSet<(bool, usize)>;
 pub struct RuleGenerator {
     bin: Binarizer,
     max: usize,
-    rules: Vec<(usize, HashSet<(bool, usize)>, f64)>,
+    rules: Vec<(usize, Pattern, f64, usize)>,
     labels: Series,
     fallback_label: usize,
     features: Vec<String>,
     remaining: Vec<usize>,
     deep: usize,
+    decay: Vec<f64>,
+    retention: Vec<f64>,
 }
 
 impl RuleGenerator {
     #[must_use]
-    pub fn new(bin: &Binarizer, max: usize, deep: usize) -> Self {
+    pub fn new(
+        bin: &Binarizer,
+        max: usize,
+        deep: usize,
+        decay: Vec<f64>,
+        retention: Vec<f64>,
+    ) -> Self {
         Self {
             bin: bin.clone(),
             max,
@@ -34,19 +42,22 @@ impl RuleGenerator {
             features: Vec::new(),
             remaining: Vec::new(),
             deep,
+            decay,
+            retention,
         }
     }
 
     #[must_use]
-    pub fn get_rules(&self) -> Vec<(usize, Vec<(bool, String)>)> {
+    pub fn get_rules(&self) -> Vec<(usize, Vec<(bool, String)>, usize)> {
         self.rules
             .iter()
-            .map(|(a, x, _)| {
+            .map(|(a, x, _, t)| {
                 (
                     *a,
                     x.iter()
                         .map(|(b, i)| (*b, self.features[*i].clone()))
                         .collect(),
+                    *t,
                 )
             })
             .collect()
@@ -56,15 +67,13 @@ impl RuleGenerator {
         let data: DataFrame = self.bin.transform(data)?;
         let mut predictions: Vec<Option<usize>> = vec![None; data.height()];
 
-        for (label, pattern, _size) in &self.rules {
+        for (label, pattern, _size, _) in &self.rules {
             let coverage = self.par_coverage(&data, pattern);
 
             // Iterate over each index in the coverage vector (a)
             for (&is_covered, prediction) in coverage?.iter().zip(predictions.iter_mut()) {
-                if prediction.is_none() {
-                    if is_covered == 1. {
-                        *prediction = Some(*label);
-                    }
+                if prediction.is_none() && is_covered == 1. {
+                    *prediction = Some(*label);
                 }
             }
         }
@@ -87,33 +96,49 @@ impl RuleGenerator {
         ))
     }
 
-    pub fn predict_exact(&self, data: &DataFrame) -> PolarsResult<Series> {
+    pub fn predict_exact(&self, data: &DataFrame) -> PolarsResult<(Series, Series)> {
         let data: DataFrame = self.bin.transform(data)?;
         let mut predictions: Vec<Option<usize>> = vec![None; data.height()];
+        let mut rule_index: Vec<Option<usize>> = vec![None; data.height()];
 
-        for (label, pattern, _size) in &self.rules {
+        for (idx, (label, pattern, _size, _)) in self.rules.iter().enumerate() {
             let coverage = self.par_coverage(&data, pattern);
 
-            for (&is_covered, prediction) in coverage?.iter().zip(predictions.iter_mut()) {
-                if prediction.is_none() {
-                    if is_covered == 1. {
-                        *prediction = Some(*label);
-                    }
-                }
-            }
+            coverage?
+                .iter()
+                .zip(predictions.iter_mut())
+                .zip(rule_index.iter_mut())
+                .filter(|((&is_covered, prediction), _)| prediction.is_none() && is_covered == 1.)
+                .map(|((_, prediction), rule_idx)| (prediction, rule_idx))
+                .for_each(|(prediction, rile_idx)| {
+                    *prediction = Some(*label);
+                    *rile_idx = Some(idx)
+                });
         }
 
-        Ok(Series::new(
-            "Predictions".into(),
-            predictions
-                .iter()
-                .map(|x| {
-                    x.as_ref().map_or_else(
-                        || AnyValue::Null,
-                        |x| self.labels.get(*x).unwrap_or(AnyValue::Null),
-                    )
-                })
-                .collect::<Vec<_>>(),
+        Ok((
+            Series::new(
+                "Predictions".into(),
+                predictions
+                    .iter()
+                    .map(|x| {
+                        x.as_ref().map_or_else(
+                            || AnyValue::Null,
+                            |x| self.labels.get(*x).unwrap_or(AnyValue::Null),
+                        )
+                    })
+                    .collect::<Vec<_>>(),
+            ),
+            Series::new(
+                "RuleIndex".into(),
+                rule_index
+                    .iter()
+                    .map(|x| {
+                        x.as_ref()
+                            .map_or_else(|| AnyValue::Null, |x| AnyValue::UInt64(*x as u64))
+                    })
+                    .collect::<Vec<_>>(),
+            ),
         ))
     }
 
@@ -123,7 +148,7 @@ impl RuleGenerator {
 
         let mut confidence = vec![vec![0.0_f64; self.labels.len()]; data.height()];
 
-        for (label, pattern, size) in &self.rules {
+        for (label, pattern, size, _) in &self.rules {
             let coverage = self.par_coverage(&data, pattern);
 
             for (&is_covered, (prediction, conf)) in coverage?
@@ -134,7 +159,7 @@ impl RuleGenerator {
                     if is_covered == 1. {
                         *prediction = Some(*label);
                     }
-                    conf[*label] = (conf[*label]) + is_covered * (*size);
+                    conf[*label] += is_covered * (*size);
                 }
             }
         }
@@ -202,7 +227,7 @@ impl RuleGenerator {
 
         let mut prev_degree_patterns: Vec<Pattern> = vec![HashSet::new()];
 
-        let mut prime_patterns: Vec<(usize, Pattern, f64)> = Vec::new();
+        let mut prime_patterns: Vec<(usize, Pattern, f64, usize)> = Vec::new();
 
         for d in 1..=max_features {
             println!("{d}");
@@ -238,8 +263,27 @@ impl RuleGenerator {
                             continue;
                         }
 
+                        let covered: usize = counts.iter().sum();
                         let score1 = if tmp == 1 {
-                            counts.iter().max().unwrap().clone()
+                            counts
+                                .iter()
+                                .enumerate()
+                                .filter(|(i, &x)| {
+                                    x as f64 / grouped_dfs[*i].shape().0 as f64 > self.decay[*i]
+                                        && x as f64 / covered as f64 >= self.retention[*i]
+                                })
+                                .max_by_key(|(i, &x)| {
+                                    if x as f64 / grouped_dfs[*i].shape().0 as f64 > self.decay[*i]
+                                        && x as f64 / covered as f64 >= self.retention[*i]
+                                    {
+                                        x
+                                    } else {
+                                        0
+                                    }
+                                })
+                                .unwrap_or((0, &0))
+                                .1
+                                .to_owned()
                         } else {
                             0
                         };
@@ -259,7 +303,7 @@ impl RuleGenerator {
                 for i in (0..curr_degree_patterns.len()).rev() {
                     let pattern = &curr_degree_patterns[i].0;
 
-                    let (counts, tmp) = self.count(&grouped_dfs, &pattern)?;
+                    let (counts, tmp) = self.count(&grouped_dfs, pattern)?;
                     if tmp == 0 {
                         curr_degree_patterns.swap_remove(i);
                         continue;
@@ -285,35 +329,53 @@ impl RuleGenerator {
                         handle.update();
                     }
 
-                    let score1 = counts.iter().max().unwrap();
+                    let covered: usize = counts.iter().sum();
+                    let (msa, score1) = counts
+                        .iter()
+                        .enumerate()
+                        .filter(|(i, &x)| {
+                            x as f64 / grouped_dfs[*i].shape().0 as f64 > self.decay[*i]
+                                && x as f64 / covered as f64 >= self.retention[*i]
+                        })
+                        .max_by_key(|(i, &x)| {
+                            if x as f64 / grouped_dfs[*i].shape().0 as f64 > self.decay[*i]
+                                && x as f64 / covered as f64 >= self.retention[*i]
+                            {
+                                x
+                            } else {
+                                0
+                            }
+                        })
+                        .unwrap_or((0, &0));
 
-                    max_score_at = (
-                        (counts.iter().position(|&x| x == *score1).unwrap(), *score1),
-                        i,
-                    );
+                    if *score1 == 0 {
+                        curr_degree_patterns.swap_remove(i);
+                        continue;
+                    }
 
+                    max_score_at = ((msa, *score1), i);
                     let o = self.deep > 1 && flags[max_score_at.0 .0];
 
-                    if tmp == 1 && !o {
-                        let len = grouped_dfs[max_score_at.0 .0].shape().0;
-                        let mask = self.coverage(&grouped_dfs[max_score_at.0 .0], &pattern)?;
-
-                        grouped_dfs[max_score_at.0 .0] = grouped_dfs[max_score_at.0 .0]
-                            .filter(&mask.into_iter().map(|x| !x).collect())?;
-
+                    let len = grouped_dfs[max_score_at.0 .0].shape().0;
+                    if tmp == 1
+                        && !o
+                        && (*score1 as f64 / len as f64 >= f64::exp(-4.) || len < 50 && *score1 > 0)
+                    {
+                        for i in 0..grouped_dfs.len() {
+                            let mask = self.coverage(&grouped_dfs[i], pattern)?;
+                            grouped_dfs[i] =
+                                grouped_dfs[i].filter(&mask.into_iter().map(|x| !x).collect())?;
+                        }
                         prime_patterns.push((
                             max_score_at.0 .0,
                             curr_degree_patterns[max_score_at.1].0.clone(),
                             *score1 as f64 / len as f64,
+                            *score1,
                         ));
                         curr_degree_patterns.swap_remove(i);
                         flags[max_score_at.0 .0] = true;
                     } else {
-                        curr_degree_patterns[i].1 = if tmp == 1 {
-                            max_score_at.0 .1.clone()
-                        } else {
-                            0
-                        };
+                        curr_degree_patterns[i].1 = if tmp == 1 { max_score_at.0 .1 } else { 0 };
                     }
                 }
 
@@ -357,6 +419,9 @@ impl RuleGenerator {
 
         for (idx, df) in grouped_dfs.into_iter().enumerate() {
             let len = df.shape().0;
+            if len == 0 {
+                continue;
+            }
             let l = Series::new("target".into(), vec![self.labels.get(idx).unwrap(); len]);
             let data = df.hstack(&[l])?;
             remaning_data.vstack_mut(&data)?;
@@ -373,15 +438,25 @@ impl RuleGenerator {
         grouped_dfs: &Vec<DataFrame>,
         pattern: &Pattern,
     ) -> PolarsResult<(Vec<usize>, usize)> {
+        let lens: Vec<_> = grouped_dfs.iter().map(|df| df.shape().0).collect();
         let counts: Vec<usize> = grouped_dfs
             .par_iter()
             .map(|df| {
-                self.coverage(df, &pattern)
+                self.coverage(df, pattern)
                     .map(|mask| mask.into_iter().filter(|&x| x).count())
             })
             .collect::<PolarsResult<Vec<_>>>()?;
 
-        let tmp = counts.iter().filter(|&&x| x >= 1).count();
+        let tmp = counts
+            .iter()
+            .zip(lens.iter())
+            .zip(self.decay.iter())
+            .filter(|((&x, &l), &d)| {
+                // print!("{x}, {l}, {d} ");
+                x as f64 / l as f64 > d
+            })
+            .count();
+        // println!("{tmp}");
         Ok((counts, tmp))
     }
 
@@ -411,7 +486,7 @@ impl RuleGenerator {
     }
 
     fn par_coverage(&self, data: &DataFrame, pattern: &Pattern) -> PolarsResult<Vec<f64>> {
-        let pattern_iter = pattern.into_iter();
+        let pattern_iter = pattern.iter();
 
         // Initialize a boolean mask for coverage with all true values
         let mut mask = vec![0.; data.height()]; // Start with all true values
@@ -432,14 +507,14 @@ impl RuleGenerator {
             // If it's the first iteration, set the mask to the current one
             mask.iter_mut().zip(current_mask).for_each(|(a, b)| {
                 if b {
-                    *a = *a + 1.
+                    *a += 1.
                 }
             });
         }
 
         mask.iter_mut().for_each(|a| {
             if len != 0. {
-                *a = *a / len
+                *a /= len
             }
         });
 
