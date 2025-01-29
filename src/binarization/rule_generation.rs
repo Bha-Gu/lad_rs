@@ -148,7 +148,24 @@ impl RuleGenerator {
 
         let mut confidence = vec![vec![0.0_f64; self.labels.len()]; data.height()];
 
+<<<<<<< HEAD
         for (label, pattern, size, _) in &self.rules {
+=======
+        for (label, pattern, _) in &self.rules {
+            let coverage = self.coverage(&data, pattern);
+
+            // Iterate over each index in the coverage vector (a)
+            for (&is_covered, prediction) in coverage?.iter().zip(predictions.iter_mut()) {
+                if prediction.is_none() {
+                    if is_covered {
+                        *prediction = Some(*label);
+                    }
+                }
+            }
+        }
+
+        for (label, pattern, size) in &self.rules {
+>>>>>>> testing
             let coverage = self.par_coverage(&data, pattern);
 
             for (&is_covered, (prediction, conf)) in coverage?
@@ -159,7 +176,15 @@ impl RuleGenerator {
                     if is_covered == 1. {
                         *prediction = Some(*label);
                     }
+<<<<<<< HEAD
                     conf[*label] += is_covered * (*size);
+=======
+<<<<<<< HEAD
+                    conf[*label] += is_covered * (*size) as f64;
+=======
+                    conf[*label] = (conf[*label]) + is_covered * (*size);
+>>>>>>> testing
+>>>>>>> testing
                 }
             }
         }
@@ -206,6 +231,9 @@ impl RuleGenerator {
 
         // Divide data into groups based on the labels
         let mut grouped_dfs: Vec<DataFrame> = self.divide_data(data, labels);
+
+        let base_shapes: Vec<_> = grouped_dfs.iter().map(|df| df.shape().0).collect();
+
         self.fallback_label = grouped_dfs
             .iter()
             .enumerate()
@@ -257,10 +285,39 @@ impl RuleGenerator {
                             continue;
                         }
 
+<<<<<<< HEAD
+                        let counts: Vec<usize> = grouped_dfs
+                            .par_iter()
+                            .map(|df| {
+                                self.coverage(df, &next_pattern)
+                                    .map(|mask| mask.into_iter().filter(|&x| x).count())
+                            })
+                            .collect::<PolarsResult<Vec<_>>>()?;
+
+                        let tmp = counts.iter().filter(|&&x| x >= 1).count();
+
+                        if tmp == 1 {
+                            for (i, count) in counts.into_iter().enumerate() {
+                                if count == 0 || grouped_dfs[i].shape().0 == 0 {
+                                    continue;
+                                }
+
+                                // Filter the DataFrame based on the coverage mask
+                                let mask = self.coverage(&grouped_dfs[i], &next_pattern)?;
+                                grouped_dfs[i] = grouped_dfs[i]
+                                    .filter(&mask.into_iter().map(|x| !x).collect())?;
+
+                                prime_patterns.push((i, next_pattern, count));
+                                break; // Break after first match
+                            }
+                        } else if tmp != 0 {
+                            curr_degree_patterns.push(next_pattern);
+=======
                         let (counts, tmp) = self.count(&grouped_dfs, &next_pattern)?;
 
                         if tmp == 0 {
                             continue;
+>>>>>>> testing
                         }
 
                         let covered: usize = counts.iter().sum();
