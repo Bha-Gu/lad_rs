@@ -273,7 +273,7 @@ impl RuleGenerator {
                     }
                     if curr_pattern.len() == d - 1 {
                         for idx in 0..features.len() {
-                            for &term in &[true, false] {
+                            for term in [true, false] {
                                 let mut next_pattern = curr_pattern.clone();
                                 if !next_pattern.insert((term, idx)) {
                                     continue;
@@ -283,28 +283,46 @@ impl RuleGenerator {
                                 if tmp == 0 {
                                     continue;
                                 }
+                                let mut lens = grouped_dfs
+                                    .iter()
+                                    .map(|x| x.shape().0 as f64)
+                                    .zip(counts.iter().map(|&x| x as f64))
+                                    .map(|(l, c)| c / l)
+                                    .collect::<Vec<_>>();
+
+                                let max_lens = lens.iter().cloned().fold(0. / 0., f64::max);
+
+                                for len in lens.iter_mut() {
+                                    *len /= max_lens;
+                                }
+
+                                if let Some(pos) = lens.iter().position(|&x| x == 1.0) {
+                                    lens[pos] = 0.0;
+                                }
+                                let n = lens.len() as f64;
+                                let mean = lens.iter().sum::<f64>() / n;
+
+                                // Calculate the variance (population standard deviation).
+                                let variance =
+                                    lens.iter().map(|&x| (x - mean).powi(2)).sum::<f64>() / n;
+
+                                let std_dev = variance.sqrt();
+
                                 let max_value = counts.iter().cloned().max().unwrap_or_default();
-                                // let max = vec![max_value; counts.len()];
-                                // let score = Binarizer::score(
-                                //     &counts.iter().map(|x| *x as u128).collect::<Vec<_>>(),
-                                //     &max.iter().map(|x| *x as u128).collect::<Vec<_>>(),
-                                // );
-                                // if score < self.bin.threshold {
-                                //     continue;
-                                // }
                                 let condition = {
                                     if self.deep == 9 {
-                                        base_score
-                                            .checked_mul(193)
-                                            .map(|p| p / 122)
-                                            .unwrap_or_else(|| (base_score / 122) * 193)
+                                        base_score.checked_mul(193).map(|p| p / 122).unwrap_or_else(
+                                            || (base_score / 122).saturating_mul(193),
+                                        )
                                     } else {
                                         base_score
                                     }
                                 };
 
                                 let score1 = counts.iter().max().unwrap_or(&0).to_owned();
-                                if score1 < condition && tmp != 1 || score1 < base_score && tmp == 1
+                                if score1 < condition && tmp != 1
+                                    || score1 < base_score && tmp == 1
+                                    || std_dev > 1. / E
                                 {
                                     continue;
                                 }
