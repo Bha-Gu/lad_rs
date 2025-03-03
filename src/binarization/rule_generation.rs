@@ -3,9 +3,9 @@ use std::{collections::HashSet, f64::consts::E};
 use super::binarize::Binarizer;
 use itertools::Itertools;
 use polars::prelude::*;
-use std::time::Instant;
-
 use rayon::prelude::*;
+use serde::{Deserialize, Serialize};
+use std::time::Instant;
 
 use notify_rust::Notification;
 
@@ -13,7 +13,7 @@ type Pattern = HashSet<(bool, usize)>;
 
 const STEP_SIZE: usize = 100000;
 
-#[derive(Clone)]
+#[derive(Clone, Serialize, Deserialize)]
 pub struct RuleGenerator {
     bin: Binarizer,
     max: usize,

@@ -1,8 +1,8 @@
+use polars::prelude::*;
+use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 
-use polars::prelude::*;
-
-#[derive(Clone)]
+#[derive(Clone, Serialize, Deserialize)]
 pub struct Binarizer {
     cutpoints: Vec<Series>,
     pub threshold: f64,
