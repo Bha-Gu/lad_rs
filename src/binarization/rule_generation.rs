@@ -1,19 +1,22 @@
+use std::cmp::Reverse;
 use std::{collections::HashSet, f64::consts::E};
 
 use super::binarize::Binarizer;
 use itertools::Itertools;
+use notify_rust::Notification;
 use polars::prelude::*;
 use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
+use std::error::Error;
+use std::fs::File;
+use std::io::{BufReader, BufWriter};
 use std::time::Instant;
-
-use notify_rust::Notification;
 
 type Pattern = HashSet<(bool, usize)>;
 
 const STEP_SIZE: usize = 100000;
 
-#[derive(Clone, Serialize, Deserialize)]
+#[derive(Clone)]
 pub struct RuleGenerator {
     bin: Binarizer,
     max: usize,
@@ -25,6 +28,21 @@ pub struct RuleGenerator {
     deep: usize,
     decay: Vec<f64>,
     retention: Vec<f64>,
+}
+
+#[derive(Serialize, Deserialize)]
+struct RuleGeneratorSaver {
+    max: usize,
+    rules: Vec<(usize, Pattern, f64, usize)>,
+    fallback_label: usize,
+    features: Vec<String>,
+    remaining: Vec<usize>,
+    deep: usize,
+    decay: Vec<f64>,
+    retention: Vec<f64>,
+    // Filenames for non-serializable parts.
+    bin_json: String,
+    labels_csv: String,
 }
 
 impl RuleGenerator {
@@ -48,6 +66,79 @@ impl RuleGenerator {
             decay,
             retention,
         }
+    }
+
+    pub fn save(self, json_path: &str, work_dir: &str) -> Result<(), Box<dyn Error>> {
+        // Define file paths for the non-serializable fields.
+        let bin_json = format!("{}/binarizer.json", work_dir);
+        let labels_csv = format!("{}/labels.csv", work_dir);
+
+        // Save the Binarizer.
+        self.bin.save(&bin_json, work_dir)?;
+
+        // Save the labels Series to CSV.
+        {
+            let mut file = File::create(&labels_csv)?;
+            let mut df = DataFrame::new(unsafe { vec![self.labels.clone()] })?;
+            CsvWriter::new(&mut file).finish(&mut df)?;
+        }
+
+        // Build the dummy struct for the rest of RuleGenerator.
+        let saver = RuleGeneratorSaver {
+            max: self.max,
+            rules: self.rules.clone(),
+            fallback_label: self.fallback_label,
+            features: self.features.clone(),
+            remaining: self.remaining.clone(),
+            deep: self.deep,
+            decay: self.decay.clone(),
+            retention: self.retention.clone(),
+            bin_json: bin_json.clone(),
+            labels_csv: labels_csv.clone(),
+        };
+
+        let file = File::create(json_path)?;
+        let writer = BufWriter::new(file);
+        serde_json::to_writer(writer, &saver)?;
+        Ok(())
+    }
+
+    // Load RuleGenerator: reads the JSON file, then loads the Binarizer and labels Series.
+    pub fn load(
+        json_path: &str,
+        work_dir: &str,
+    ) -> Result<(Binarizer, RuleGenerator), Box<dyn Error>> {
+        let file = File::open(json_path)?;
+        let reader = BufReader::new(file);
+        let saver: RuleGeneratorSaver = serde_json::from_reader(reader)?;
+
+        // Load the Binarizer.
+        let bin = Binarizer::load(&saver.bin_json, work_dir)?;
+
+        // Load the labels Series.
+        let labels = {
+            let file = File::open(&saver.labels_csv)?;
+            let df = CsvReader::new(file).finish()?;
+            df.select_at_idx(0)
+                .ok_or("No column found in labels CSV")?
+                .clone()
+        };
+
+        Ok((
+            bin.clone(),
+            RuleGenerator {
+                bin,
+                max: saver.max,
+                rules: saver.rules,
+                labels,
+                fallback_label: saver.fallback_label,
+                features: saver.features,
+                remaining: saver.remaining,
+                deep: saver.deep,
+                decay: saver.decay,
+                retention: saver.retention,
+            },
+        ))
     }
 
     #[must_use]
@@ -99,12 +190,20 @@ impl RuleGenerator {
         ))
     }
 
-    pub fn predict_exact(&self, data: &DataFrame) -> PolarsResult<(Series, Series, DataFrame)> {
+    pub fn predict_exact(
+        &self,
+        data: &DataFrame,
+        until: usize,
+    ) -> PolarsResult<(Series, Series, DataFrame)> {
         let data: DataFrame = self.bin.transform(data)?;
         let mut predictions: Vec<Option<usize>> = vec![None; data.height()];
         let mut rule_index: Vec<Option<usize>> = vec![None; data.height()];
 
-        for (idx, (label, pattern, _size, _)) in self.rules.iter().enumerate() {
+        for (idx, (label, pattern, _size, count)) in self.rules.iter().enumerate() {
+            if *count < until {
+                break;
+            }
+
             let coverage = self.par_coverage(&data, pattern);
 
             coverage?
@@ -236,7 +335,7 @@ impl RuleGenerator {
         loop {
             let mut base_score = 0;
             let mut prev_degree_patterns: Vec<(Pattern, usize, usize)> =
-                vec![(HashSet::new(), 0, 2)];
+                unsafe { vec![(HashSet::new(), 0, 2)] };
             let mut found_at = max_features;
 
             for d in 1..=max_features {
@@ -247,18 +346,20 @@ impl RuleGenerator {
                 let length = prev_degree_patterns.len();
                 let step = (length / STEP_SIZE).max(1);
                 let mut max_score = 0;
+                prev_degree_patterns.sort_by_key(|(_, score, _)| Reverse(*score));
                 for (pattern_idx, (curr_pattern, score0, tmp0)) in
                     prev_degree_patterns.into_iter().enumerate()
                 {
                     if pattern_idx % step == 0 {
                         handle.body(&format!(
-                            "processing pattern: {}/{} at depth {} with base {} {:?} {}",
+                            "processing pattern: {}/{} at depth {} with base {} {:?} {} {}",
                             pattern_idx + 1,
                             length,
                             d,
                             base_score,
                             remaining_shapes,
-                            max_score
+                            max_score,
+                            score0
                         ));
                         handle.update();
                     }
@@ -268,7 +369,7 @@ impl RuleGenerator {
 
                     curr_degree_patterns.push((curr_pattern.clone(), score0, tmp0));
 
-                    if tmp0 == 1 {
+                    if tmp0 == 1 || (score0 == base_score && base_score != 0) {
                         continue;
                     }
                     if curr_pattern.len() == d - 1 {
@@ -322,7 +423,7 @@ impl RuleGenerator {
                                 let score1 = counts.iter().max().unwrap_or(&0).to_owned();
                                 if score1 < condition && tmp != 1
                                     || score1 < base_score && tmp == 1
-                                    || std_dev > 1. / E
+                                    || std_dev > 0.5 / E
                                 {
                                     continue;
                                 }
@@ -444,7 +545,8 @@ impl RuleGenerator {
             .show()
             .unwrap();
 
-        let mut prev_degree_patterns: Vec<(Pattern, usize, usize)> = vec![(HashSet::new(), 0, 2)];
+        let mut prev_degree_patterns: Vec<(Pattern, usize, usize)> =
+            unsafe { vec![(HashSet::new(), 0, 2)] };
 
         let mut prime_patterns: Vec<(usize, Pattern, f64, usize)> = Vec::new();
 

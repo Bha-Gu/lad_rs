@@ -1,14 +1,26 @@
 use polars::prelude::*;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
+use std::error::Error;
+use std::fs::File;
+use std::io::{BufReader, BufWriter};
 
-#[derive(Clone, Serialize, Deserialize)]
+#[derive(Clone)]
 pub struct Binarizer {
     cutpoints: Vec<Series>,
     pub threshold: f64,
     nominal_size: usize,
     max_cutpoints: usize,
     depth: usize,
+}
+
+#[derive(Clone, Serialize, Deserialize)]
+struct BinSaver {
+    pub threshold: f64,
+    nominal_size: usize,
+    max_cutpoints: usize,
+    depth: usize,
+    num_cutpoints: usize,
 }
 
 impl Binarizer {
@@ -26,6 +38,64 @@ impl Binarizer {
             max_cutpoints: max_cutpoints_per_column,
             depth,
         }
+    }
+
+    pub fn save(self, json_path: &str, csv_dir: &str) -> Result<(), Box<dyn Error>> {
+        // Save each Series as a CSV file named "cutpoints_{i}.csv"
+        for (i, series) in self.cutpoints.iter().enumerate() {
+            let file_path = format!("{}/cutpoints_{}.csv", csv_dir, i);
+            let mut file = File::create(&file_path)?;
+            // Wrap the Series in a DataFrame so that we can write it as CSV.
+            let mut df = DataFrame::new(vec![series.clone()])?;
+            CsvWriter::new(&mut file).finish(&mut df)?;
+        }
+
+        // Create a dummy struct to hold the other fields.
+        let saver = BinSaver {
+            threshold: self.threshold,
+            nominal_size: self.nominal_size,
+            max_cutpoints: self.max_cutpoints,
+            depth: self.depth,
+            num_cutpoints: self.cutpoints.len(),
+        };
+
+        let file = File::create(json_path)?;
+        let writer = BufWriter::new(file);
+        serde_json::to_writer(writer, &saver)?;
+        Ok(())
+    }
+
+    // Load function:
+    // - Reads the BinSaver from the JSON file to recover non-Series fields.
+    // - Loads each CSV file (assumed named "cutpoints_{i}.csv") to reconstruct the Series vector.
+    pub fn load(json_path: &str, csv_dir: &str) -> Result<Binarizer, Box<dyn Error>> {
+        // Load the dummy struct from JSON.
+        let file = File::open(json_path)?;
+        let reader = BufReader::new(file);
+        let saver: BinSaver = serde_json::from_reader(reader)?;
+
+        // Read the Series CSV files.
+        let mut cutpoints = Vec::with_capacity(saver.num_cutpoints);
+        for i in 0..saver.num_cutpoints {
+            let file_path = format!("{}/cutpoints_{}.csv", csv_dir, i);
+            let file = File::open(file_path)?;
+            let df = CsvReader::new(file).finish()?;
+            // Assuming each CSV file contains one column, we extract it.
+            let series = df
+                .select_at_idx(0)
+                .ok_or_else(|| format!("No column found in CSV cutpoints_{}.csv", i))?
+                .clone();
+            cutpoints.push(series);
+        }
+
+        // Reconstruct the full Binarizer.
+        Ok(Binarizer {
+            cutpoints,
+            threshold: saver.threshold,
+            nominal_size: saver.nominal_size,
+            max_cutpoints: saver.max_cutpoints,
+            depth: saver.depth,
+        })
     }
 
     #[must_use]
