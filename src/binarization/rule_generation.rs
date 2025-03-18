@@ -10,6 +10,8 @@ use serde::{Deserialize, Serialize};
 use std::error::Error;
 use std::fs::File;
 use std::io::{BufReader, BufWriter};
+use std::sync::mpsc;
+use std::thread;
 use std::time::Instant;
 
 type Pattern = HashSet<(bool, usize)>;
@@ -245,60 +247,148 @@ impl RuleGenerator {
         ))
     }
 
-    pub fn predict_fuzzy(&self, data: &DataFrame) -> PolarsResult<Series> {
+    pub fn predict_fuzzy(
+        &self,
+        data: &DataFrame,
+        until: usize,
+    ) -> PolarsResult<(Series, Series, DataFrame)> {
+        // Create a channel for sending notification messages
+        let (tx, rx) = mpsc::channel::<String>();
+
+        // Spawn a thread to handle notifications
+        let notifier_handle = thread::spawn(move || {
+            // Create the notification instance in the thread
+            let mut handle = Notification::new()
+                .summary("Task Progress")
+                .body("Task is starting")
+                .show()
+                .unwrap();
+
+            // Loop and update notifications as messages are received.
+            for msg in rx {
+                handle.body(&msg);
+                handle.update();
+            }
+        });
+
         let data: DataFrame = self.bin.transform(data)?;
         let mut predictions: Vec<Option<usize>> = vec![None; data.height()];
+        let mut rule_index: Vec<Option<usize>> = vec![None; data.height()];
+        let mut fuzzy = vec![vec![(0, 0); data.width()]; self.labels.len()];
 
-        let mut confidence = vec![vec![0.0_f64; self.labels.len()]; data.height()];
+        for (idx, (label, pattern, _size, count)) in self.rules.iter().enumerate() {
+            if *count < until {
+                break;
+            }
 
-        for (label, pattern, size, _) in &self.rules {
-            let coverage = self.par_coverage(&data, pattern);
+            let pattern_iter = pattern.iter();
 
-            for (&is_covered, (prediction, conf)) in coverage?
-                .iter()
-                .zip(predictions.iter_mut().zip(confidence.iter_mut()))
-            {
-                if prediction.is_none() {
-                    if is_covered == 1. {
-                        *prediction = Some(*label);
-                    }
-                    conf[*label] += is_covered * (*size);
+            // Initialize a boolean mask for coverage with all true values
+            let mut mask = vec![true; data.height()]; // Start with all true values
+
+            // Iterate over each pattern element (value and column name)
+            for (term, col_name) in pattern_iter {
+                let col = data.column(&self.features[*col_name])?;
+
+                // Create a boolean mask for the current column by comparing its values with the pattern term
+                let current_mask = col
+                    .bool()?
+                    .into_iter()
+                    .map(|val| val.unwrap_or(false) == *term);
+
+                // If it's the first iteration, set the mask to the current one
+                mask.iter_mut()
+                    .zip(current_mask)
+                    .for_each(|(a, b)| *a = *a && b);
+            }
+
+            for i in pattern {
+                if i.0 {
+                    fuzzy[*label][i.1].0 += count;
+                } else {
+                    fuzzy[*label][i.1].1 += count;
                 }
             }
+
+            // let coverage = self.par_coverage(&data, pattern);
+
+            mask.iter()
+                .zip(predictions.iter_mut())
+                .zip(rule_index.iter_mut())
+                .filter(|((&is_covered, prediction), _)| prediction.is_none() && is_covered)
+                .map(|((_, prediction), rule_idx)| (prediction, rule_idx))
+                .for_each(|(prediction, rile_idx)| {
+                    *prediction = Some(*label);
+                    *rile_idx = Some(idx)
+                });
         }
 
-        predictions
-            .iter_mut()
-            .zip(confidence.iter())
-            .map(|(a, b)| {
-                let arg_max = b
-                    .iter()
-                    .enumerate()
-                    .max_by(|(_, val1), (_, val2)| val1.partial_cmp(val2).unwrap())
-                    .map(|(index, _)| index);
-                (a, arg_max)
-            })
-            .for_each(|(a, b)| {
-                if a.is_none() {
-                    *a = b;
-                }
-            });
+        // For each row with a None prediction, compute the similarity against each class.
+        for (row_idx, prediction) in predictions.iter_mut().enumerate() {
+            if prediction.is_none() {
+                let mut best_label = None;
+                let mut best_similarity = 0f64;
 
-        Ok(Series::new(
-            "Predictions".into(),
-            predictions
-                .iter()
-                .map(|x| {
-                    x.as_ref().map_or_else(
-                        || {
-                            self.labels
-                                .get(self.fallback_label)
-                                .unwrap_or(AnyValue::Null)
-                        },
-                        |x| self.labels.get(*x).unwrap_or(AnyValue::Null),
-                    )
-                })
-                .collect::<Vec<_>>(),
+                // Iterate over each label's fuzzy vector.
+                for (label_idx, fuzzy_values) in fuzzy.iter().enumerate() {
+                    let mut similarity = 0f64;
+
+                    // Iterate over each feature.
+                    for (col_idx, (true_count, false_count)) in fuzzy_values.iter().enumerate() {
+                        let total = true_count + false_count;
+                        if total == 0 {
+                            continue; // Avoid division by zero if no counts are recorded.
+                        }
+                        // Normalize the counts to get proportions.
+                        let normalized_true = *true_count as f64 / total as f64;
+                        let normalized_false = *false_count as f64 / total as f64;
+
+                        // Retrieve the boolean value of the row for this feature.
+                        let col = data.column(&self.features[col_idx])?;
+                        let value = col.bool()?.get(row_idx);
+
+                        if let Some(row_val) = value {
+                            similarity += if row_val {
+                                normalized_true
+                            } else {
+                                normalized_false
+                            };
+                        }
+                    }
+
+                    // Check if this label's similarity is the best so far.
+                    if similarity > best_similarity {
+                        best_similarity = similarity;
+                        best_label = Some(label_idx);
+                    }
+                }
+                *prediction = best_label;
+            }
+        }
+        Ok((
+            Series::new(
+                "Predictions".into(),
+                predictions
+                    .iter()
+                    .map(|x| {
+                        x.as_ref().map_or_else(
+                            || AnyValue::Null,
+                            |x| self.labels.get(*x).unwrap_or(AnyValue::Null),
+                        )
+                    })
+                    .collect::<Vec<_>>(),
+            ),
+            Series::new(
+                "RuleIndex".into(),
+                rule_index
+                    .iter()
+                    .map(|x| {
+                        x.as_ref()
+                            .map_or_else(|| AnyValue::Null, |x| AnyValue::UInt64(*x as u64))
+                    })
+                    .collect::<Vec<_>>(),
+            ),
+            data,
         ))
     }
 
@@ -322,17 +412,32 @@ impl RuleGenerator {
             self.max
         };
 
-        let mut handle = Notification::new()
-            .summary("Task Progress")
-            .body("Task is starting")
-            .show()
-            .unwrap();
+        // Create a channel for sending notification messages
+        let (tx, rx) = mpsc::channel::<String>();
+
+        // Spawn a thread to handle notifications
+        let notifier_handle = thread::spawn(move || {
+            // Create the notification instance in the thread
+            let mut handle = Notification::new()
+                .summary("Task Progress")
+                .body("Task is starting")
+                .show()
+                .unwrap();
+
+            // Loop and update notifications as messages are received.
+            for msg in rx {
+                handle.body(&msg);
+                handle.update();
+            }
+        });
 
         let mut prime_patterns: Vec<(usize, Pattern, f64, usize)> = Vec::new();
-
         let mut flag = false;
 
+        let mut icount = 0;
+
         loop {
+            icount += 1;
             let mut base_score = 0;
             let mut prev_degree_patterns: Vec<(Pattern, usize, usize)> =
                 unsafe { vec![(HashSet::new(), 0, 2)] };
@@ -340,18 +445,31 @@ impl RuleGenerator {
 
             for d in 1..=max_features {
                 let mut curr_degree_patterns = Vec::new();
-                //let mut curr_patterns_score = Vec::new();
                 let remaining_shapes: Vec<_> = grouped_dfs.iter().map(|df| df.shape().0).collect();
 
                 let length = prev_degree_patterns.len();
                 let step = (length / STEP_SIZE).max(1);
                 let mut max_score = 0;
-                prev_degree_patterns.sort_by_key(|(_, score, _)| Reverse(*score));
+                prev_degree_patterns.sort_by_key(|(_, score, tmp)| (Reverse(*score), *tmp));
+                let mut last = prev_degree_patterns.get(0).map(|x| x.clone());
+                last = None;
                 for (pattern_idx, (curr_pattern, score0, tmp0)) in
                     prev_degree_patterns.into_iter().enumerate()
                 {
+                    // Send notification updates via the channel instead of blocking the main thread.
+
+                    if let Some(last_in) = last.clone() {
+                        if tmp0 == last_in.2 && score0 == last_in.1 && curr_pattern == last_in.0 {
+                            continue;
+                        } else {
+                            last = Some((curr_pattern.clone(), score0, tmp0));
+                        }
+                    } else {
+                        last = Some((curr_pattern.clone(), score0, tmp0));
+                    }
+
                     if pattern_idx % step == 0 {
-                        handle.body(&format!(
+                        let msg = format!(
                             "processing pattern: {}/{} at depth {} with base {} {:?} {} {}",
                             pattern_idx + 1,
                             length,
@@ -360,9 +478,24 @@ impl RuleGenerator {
                             remaining_shapes,
                             max_score,
                             score0
-                        ));
-                        handle.update();
+                        );
+                        // Send the message to the notification thread.
+                        let _ = tx.send(msg);
                     }
+                    // let len2 = grouped_dfs
+                    //     .iter()
+                    //     .map(|x| x.shape().0)
+                    //     .fold((0, 0), |acc, val| {
+                    //         if val > acc.0 {
+                    //             (val, acc.0)
+                    //         } else if val > acc.1 {
+                    //             (acc.0, val)
+                    //         } else {
+                    //             acc
+                    //         }
+                    //     })
+                    //     .1;
+
                     if tmp0 == 0 || score0 < base_score {
                         continue;
                     }
@@ -373,7 +506,13 @@ impl RuleGenerator {
                         continue;
                     }
                     if curr_pattern.len() == d - 1 {
+                        let max_idx = { curr_pattern.iter().map(|(_, a)| *a).max() };
                         for idx in 0..features.len() {
+                            if let Some(max_idx) = max_idx {
+                                if max_idx >= idx {
+                                    continue;
+                                }
+                            }
                             for term in [true, false] {
                                 let mut next_pattern = curr_pattern.clone();
                                 if !next_pattern.insert((term, idx)) {
@@ -421,9 +560,8 @@ impl RuleGenerator {
                                 };
 
                                 let score1 = counts.iter().max().unwrap_or(&0).to_owned();
-                                if score1 < condition && tmp != 1
-                                    || score1 < base_score && tmp == 1
-                                    || std_dev > 0.5 / E
+                                if score1 < condition && tmp != 1 || score1 < base_score && tmp == 1
+                                // || (std_dev > 0.5 / E)
                                 {
                                     continue;
                                 }
@@ -446,11 +584,7 @@ impl RuleGenerator {
                     .filter(|(_, a, _)| *a >= base_score)
                     .collect();
 
-                if max_score <= base_score || found_at + 2 == d
-                // || (base_score as f64 >= max_score as f64 * (1. - f64::exp(-1.))
-                //     && self.deep == 9)
-                // || d == max_features
-                {
+                if max_score <= base_score || found_at + 2 == d {
                     break;
                 }
             }
@@ -513,9 +647,14 @@ impl RuleGenerator {
         }
 
         self.rules = prime_patterns;
+
+        // Optionally, drop the sender to signal the notification thread to exit.
+        drop(tx);
+        // Wait for the notification thread to finish.
+        let _ = notifier_handle.join();
+
         Ok(remaning_data)
     }
-
     pub fn fit(&mut self, data: &DataFrame, labels: &Series) -> PolarsResult<DataFrame> {
         if self.deep >= 9 {
             return self.fit2(data, labels);
