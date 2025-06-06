@@ -399,6 +399,7 @@ impl RuleGenerator {
 
         // Divide data into groups based on the labels
         let mut grouped_dfs: Vec<DataFrame> = self.divide_data(data, labels);
+        // println!("{grouped_dfs:?}");
         self.fallback_label = grouped_dfs
             .iter()
             .enumerate()
@@ -440,7 +441,7 @@ impl RuleGenerator {
             icount += 1;
             let mut base_score = 0;
             let mut prev_degree_patterns: Vec<(Pattern, usize, usize)> =
-                unsafe { vec![(HashSet::new(), 0, 2)] };
+                unsafe { vec![(HashSet::new(), 0, grouped_dfs.len())] };
             let mut found_at = max_features;
 
             for d in 1..=max_features {
@@ -450,24 +451,12 @@ impl RuleGenerator {
                 let length = prev_degree_patterns.len();
                 let step = (length / STEP_SIZE).max(1);
                 let mut max_score = 0;
-                prev_degree_patterns.sort_by_key(|(_, score, tmp)| (Reverse(*score), *tmp));
-                let mut last = prev_degree_patterns.get(0).map(|x| x.clone());
-                last = None;
+                let mut d1 = None;
+                prev_degree_patterns
+                    .sort_by_key(|(pattern, score, tmp)| (pattern.len(), Reverse(*score), *tmp));
                 for (pattern_idx, (curr_pattern, score0, tmp0)) in
                     prev_degree_patterns.into_iter().enumerate()
                 {
-                    // Send notification updates via the channel instead of blocking the main thread.
-
-                    if let Some(last_in) = last.clone() {
-                        if tmp0 == last_in.2 && score0 == last_in.1 && curr_pattern == last_in.0 {
-                            continue;
-                        } else {
-                            last = Some((curr_pattern.clone(), score0, tmp0));
-                        }
-                    } else {
-                        last = Some((curr_pattern.clone(), score0, tmp0));
-                    }
-
                     if pattern_idx % step == 0 {
                         let msg = format!(
                             "processing pattern: {}/{} at depth {} with base {} {:?} {} {}",
@@ -482,19 +471,6 @@ impl RuleGenerator {
                         // Send the message to the notification thread.
                         let _ = tx.send(msg);
                     }
-                    // let len2 = grouped_dfs
-                    //     .iter()
-                    //     .map(|x| x.shape().0)
-                    //     .fold((0, 0), |acc, val| {
-                    //         if val > acc.0 {
-                    //             (val, acc.0)
-                    //         } else if val > acc.1 {
-                    //             (acc.0, val)
-                    //         } else {
-                    //             acc
-                    //         }
-                    //     })
-                    //     .1;
 
                     if tmp0 == 0 || score0 < base_score {
                         continue;
@@ -505,14 +481,13 @@ impl RuleGenerator {
                     if tmp0 == 1 || (score0 == base_score && base_score != 0) {
                         continue;
                     }
+
                     if curr_pattern.len() == d - 1 {
+                        if d1.is_none() {
+                            d1 = Some(pattern_idx);
+                        }
                         let max_idx = { curr_pattern.iter().map(|(_, a)| *a).max() };
-                        for idx in 0..features.len() {
-                            if let Some(max_idx) = max_idx {
-                                if max_idx >= idx {
-                                    continue;
-                                }
-                            }
+                        for idx in max_idx.map(|x| x + 1).unwrap_or_default()..features.len() {
                             for term in [true, false] {
                                 let mut next_pattern = curr_pattern.clone();
                                 if !next_pattern.insert((term, idx)) {
@@ -520,6 +495,9 @@ impl RuleGenerator {
                                 }
 
                                 let (counts, tmp) = self.count(&grouped_dfs, &next_pattern)?;
+
+                                // println!("{d}:{next_pattern:?}->{counts:?}?{tmp}");
+
                                 if tmp == 0 {
                                     continue;
                                 }
@@ -549,42 +527,34 @@ impl RuleGenerator {
                                 let std_dev = variance.sqrt();
 
                                 let max_value = counts.iter().cloned().max().unwrap_or_default();
-                                let condition = {
-                                    if self.deep == 9 {
-                                        base_score.checked_mul(193).map(|p| p / 122).unwrap_or_else(
-                                            || (base_score / 122).saturating_mul(193),
-                                        )
-                                    } else {
-                                        base_score
-                                    }
-                                };
 
-                                let score1 = counts.iter().max().unwrap_or(&0).to_owned();
-                                if score1 < condition && tmp != 1 || score1 < base_score && tmp == 1
-                                // || (std_dev > 0.5 / E)
-                                {
+                                if max_value < base_score {
                                     continue;
                                 }
-                                if score1 > base_score && tmp == 1 {
+                                if max_value > base_score && tmp == 1 {
                                     found_at = d;
-                                    base_score = score1;
+                                    base_score = max_value;
                                 }
                                 if max_value > max_score {
                                     max_score = max_value;
                                 }
-
-                                curr_degree_patterns.push((next_pattern, score1, tmp));
+                                // println!("{next_pattern:?}, {max_value}, {tmp}");
+                                curr_degree_patterns.push((next_pattern, max_value, tmp));
                             }
                         }
                     }
                 }
-
+                // println!("{d}\n{curr_degree_patterns:?}\n");
                 prev_degree_patterns = curr_degree_patterns
                     .into_iter()
                     .filter(|(_, a, _)| *a >= base_score)
                     .collect();
 
-                if max_score <= base_score || found_at + 2 == d {
+                if max_score < base_score
+                    || found_at + 2 == d
+                    || (max_score < 2 * base_score && self.deep == 9)
+                {
+                    println!("Early Break");
                     break;
                 }
             }
@@ -599,6 +569,7 @@ impl RuleGenerator {
                 match len {
                     0 => {
                         if flag {
+                            // println!("Breaking");
                             break;
                         } else {
                             flag = true;
@@ -944,7 +915,7 @@ impl RuleGenerator {
             .zip(lens.iter())
             .zip(self.decay.iter())
             .filter(|((&x, &l), &d)| {
-                // print!("{x}, {l}, {d} ");
+                // print!("{x}, {l}, {d}\n");
                 x as f64 / l as f64 > d
             })
             .count();
