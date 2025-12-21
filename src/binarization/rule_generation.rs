@@ -4,7 +4,9 @@ use std::collections::HashSet;
 
 use super::binarize::Binarizer;
 use itertools::Itertools;
+
 use notify_rust::Notification;
+
 use polars::prelude::*;
 use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
@@ -247,9 +249,12 @@ impl RuleGenerator {
                 .unwrap();
 
             // Loop and update notifications as messages are received.
-            for msg in rx {
-                handle.body(&msg);
-                handle.update();
+            //
+            if !cfg!(target_os = "windows") {
+                for msg in rx {
+                    handle.body(&msg);
+                    handle.update();
+                }
             }
         });
 
@@ -408,9 +413,12 @@ impl RuleGenerator {
                 .unwrap();
 
             // Loop and update notifications as messages are received.
-            for msg in rx {
-                handle.body(&msg);
-                handle.update();
+
+            if !cfg!(target_os = "windows") {
+                for msg in rx {
+                    handle.body(&msg);
+                    handle.update();
+                }
             }
         });
 
@@ -724,14 +732,16 @@ impl RuleGenerator {
             for (pattern_idx, (curr_pattern, score0, tmp0)) in
                 prev_degree_patterns.into_iter().enumerate()
             {
-                if pattern_idx % step == 0 {
-                    handle.body(&format!(
-                        "processing pattern: {}/{} at depth {}",
-                        pattern_idx + 1,
-                        length,
-                        d
-                    ));
-                    handle.update();
+                if !cfg!(target_os = "windows") {
+                    if pattern_idx % step == 0 {
+                        handle.body(&format!(
+                            "processing pattern: {}/{} at depth {}",
+                            pattern_idx + 1,
+                            length,
+                            d
+                        ));
+                        handle.update();
+                    }
                 }
                 if (deep >> 2) % 2 == 1 {
                     if tmp0 == 0 {
@@ -824,15 +834,17 @@ impl RuleGenerator {
                             curr_degree_patterns.swap_remove(i);
                             continue;
                         }
-                        if i % step == 0 {
-                            handle.body(&format!(
-                                "processing best pattern: {}/{} at depth {} {:?}",
-                                length - i,
-                                length,
-                                d,
-                                lens
-                            ));
-                            handle.update();
+                        if !cfg!(target_os = "windows") {
+                            if i % step == 0 {
+                                handle.body(&format!(
+                                    "processing best pattern: {}/{} at depth {} {:?}",
+                                    length - i,
+                                    length,
+                                    d,
+                                    lens
+                                ));
+                                handle.update();
+                            }
                         }
 
                         let covered: usize = counts.iter().sum();
@@ -889,9 +901,10 @@ impl RuleGenerator {
                         }
                     }
 
-                    handle.body(&format!("Max Score: {} at depth {}", max_score_at.0 .1, d));
-                    handle.update();
-
+                    if !cfg!(target_os = "windows") {
+                        handle.body(&format!("Max Score: {} at depth {}", max_score_at.0 .1, d));
+                        handle.update();
+                    }
                     if flags.iter().all(|x| !*x) {
                         break;
                     }
