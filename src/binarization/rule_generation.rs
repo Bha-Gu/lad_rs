@@ -413,8 +413,8 @@ impl RuleGenerator {
                 .unwrap();
 
             // Loop and update notifications as messages are received.
-
-            if !cfg!(target_os = "windows") {
+            #[cfg(not(target_os = "windows"))]
+            {
                 for msg in rx {
                     handle.body(&msg);
                     handle.update();
