@@ -249,8 +249,8 @@ impl RuleGenerator {
                 .unwrap();
 
             // Loop and update notifications as messages are received.
-            //
-            if !cfg!(target_os = "windows") {
+            #[cfg(not(target_os = "windows"))]
+            {
                 for msg in rx {
                     handle.body(&msg);
                     handle.update();
@@ -732,7 +732,8 @@ impl RuleGenerator {
             for (pattern_idx, (curr_pattern, score0, tmp0)) in
                 prev_degree_patterns.into_iter().enumerate()
             {
-                if !cfg!(target_os = "windows") {
+                #[cfg(not(target_os = "windows"))]
+                {
                     if pattern_idx % step == 0 {
                         handle.body(&format!(
                             "processing pattern: {}/{} at depth {}",
@@ -834,7 +835,8 @@ impl RuleGenerator {
                             curr_degree_patterns.swap_remove(i);
                             continue;
                         }
-                        if !cfg!(target_os = "windows") {
+                        #[cfg(not(target_os = "windows"))]
+                        {
                             if i % step == 0 {
                                 handle.body(&format!(
                                     "processing best pattern: {}/{} at depth {} {:?}",
@@ -900,8 +902,8 @@ impl RuleGenerator {
                             break;
                         }
                     }
-
-                    if !cfg!(target_os = "windows") {
+                    #[cfg(not(target_os = "windows"))]
+                    {
                         handle.body(&format!("Max Score: {} at depth {}", max_score_at.0 .1, d));
                         handle.update();
                     }
