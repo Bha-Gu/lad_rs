@@ -23,6 +23,10 @@ struct BinSaver {
     num_cutpoints: usize,
 }
 
+static BOOL: &str = "Bool";
+static NOMINAL: &str = "Nominal";
+static NUMERIC: &str = "Numeric";
+
 impl Binarizer {
     #[must_use]
     pub fn new(
@@ -43,10 +47,10 @@ impl Binarizer {
     pub fn save(self, json_path: &str, csv_dir: &str) -> Result<(), Box<dyn Error>> {
         // Save each Series as a CSV file named "cutpoints_{i}.csv"
         for (i, series) in self.sorted_cutpoints.iter().enumerate() {
-            let file_path = format!("{}/cutpoints_{}.csv", csv_dir, i);
+            let file_path = format!("{csv_dir}/cutpoints_{i}.csv");
             let mut file = File::create(&file_path)?;
             // Wrap the Series in a DataFrame so that we can write it as CSV.
-            let mut df = DataFrame::new(vec![series.clone()])?;
+            let mut df = DataFrame::new(vec![series.clone().into()])?;
             CsvWriter::new(&mut file).finish(&mut df)?;
         }
 
@@ -77,14 +81,16 @@ impl Binarizer {
         // Read the Series CSV files.
         let mut cutpoints = Vec::with_capacity(saver.num_cutpoints);
         for i in 0..saver.num_cutpoints {
-            let file_path = format!("{}/cutpoints_{}.csv", csv_dir, i);
+            let file_path = format!("{csv_dir}/cutpoints_{i}.csv");
             let file = File::open(file_path)?;
             let df = CsvReader::new(file).finish()?;
             // Assuming each CSV file contains one column, we extract it.
             let series = df
                 .select_at_idx(0)
-                .ok_or_else(|| format!("No column found in CSV cutpoints_{}.csv", i))?
-                .clone();
+                .ok_or_else(|| format!("No column found in CSV cutpoints_{i}.csv"))?
+                .as_materialized_series()
+                .clone()
+                .rechunk();
             cutpoints.push(series);
         }
 
@@ -110,7 +116,7 @@ impl Binarizer {
     ) -> Result<(), PolarsError> {
         if data.shape().0 != label.len() {
             println!(
-                "Lengths of data {} and label {} do not match",
+                "Lengths of data ({}) and label ({}) do not match",
                 data.shape().0,
                 label.len()
             );
@@ -119,26 +125,33 @@ impl Binarizer {
         let schema = data.schema();
         self.sorted_cutpoints = Vec::new();
         let unique_classes = label.unique_stable()?;
-        println!("{unique_classes:?}");
 
         for (idx, (feature_name, data_type)) in schema.iter().enumerate() {
             let column = data[idx].clone();
             let a = column.n_unique().unwrap_or_default();
             if a == 2 || data_type.is_bool() {
-                let unique_values = column.unique_stable()?;
+                let unique_values = column
+                    .unique_stable()?
+                    .as_materialized_series()
+                    .clone()
+                    .rechunk();
 
                 self.sorted_cutpoints.push(Series::new(
-                    format!("Bool#{}", feature_name).into(),
+                    format!("{BOOL}#{feature_name}").into(),
                     unique_values,
                 ));
 
                 continue;
             }
             if a <= self.numeric_as_nominal_upper_threshold || data_type.is_string() {
-                let unique_values = column.unique_stable()?;
+                let unique_values = column
+                    .unique_stable()?
+                    .as_materialized_series()
+                    .clone()
+                    .rechunk();
 
                 self.sorted_cutpoints.push(Series::new(
-                    format!("Nominal#{}", feature_name).into(),
+                    format!("{NOMINAL}#{feature_name}").into(),
                     unique_values,
                 ));
 
@@ -146,12 +159,21 @@ impl Binarizer {
             }
 
             if data_type.is_numeric() {
-                let mut column_and_label = DataFrame::new(vec![label.clone(), column])?;
+                let mut column_and_label = DataFrame::new(vec![label.clone().into(), column])?;
+
                 column_and_label = column_and_label
                     .sort([feature_name.to_string()], SortMultipleOptions::default())?;
                 let mut cutpoints = Vec::new();
-                let sorted = column_and_label.drop_in_place(feature_name.as_ref())?;
-                let labels = column_and_label.drop_in_place(label.name().as_ref())?;
+                let sorted = column_and_label
+                    .drop_in_place(feature_name.as_ref())?
+                    .as_materialized_series()
+                    .clone()
+                    .rechunk();
+                let labels = column_and_label
+                    .drop_in_place(label.name().as_ref())?
+                    .as_materialized_series()
+                    .clone()
+                    .rechunk();
 
                 let mut segments = vec![(0, sorted.len())]; // Start with the full range
 
@@ -180,14 +202,9 @@ impl Binarizer {
                     segments = new_segments;
                 }
 
-                let cps = cutpoints
-                    .iter()
-                    //.rev()
-                    //.take(self.max_cutpoints)
-                    .map(|(x, _s)| x.to_owned())
-                    .collect::<Vec<_>>();
+                let cps = cutpoints.into_iter().map(|(x, _s)| x).collect::<Vec<_>>();
                 self.sorted_cutpoints
-                    .push(Series::new(format!("Numeric#{}", feature_name).into(), cps));
+                    .push(Series::new(format!("{NUMERIC}#{feature_name}").into(), cps));
             }
         }
         Ok(())
@@ -203,7 +220,7 @@ impl Binarizer {
 
         for ((dtype, feature_name), col) in names {
             let column = df.column(feature_name)?;
-            if dtype == "Bool" {
+            if dtype == BOOL {
                 let value = col.get(0)?;
                 out.hstack_mut(&[Series::new(
                     format!(
@@ -214,12 +231,13 @@ impl Binarizer {
                         }
                     )
                     .into(),
-                    column.iter().map(|x| x == value).collect::<Vec<_>>(),
-                )])?;
+                    column.phys_iter().map(|x| x == value).collect::<Vec<_>>(),
+                )
+                .into()])?;
                 continue;
             }
 
-            if dtype == "Nominal" {
+            if dtype == NOMINAL {
                 let unique_values: Vec<_> = col.iter().collect();
                 let n = unique_values.len();
                 let num_bits = (n as f64).log2().ceil() as usize;
@@ -234,29 +252,29 @@ impl Binarizer {
 
                 // Step 3: Create columns based on binary representation
                 for bit_pos in 0..num_bits {
-                    let column_name = format!("{}_bit_{}", feature_name, bit_pos);
+                    let column_name = format!("{feature_name}_bit_{bit_pos}");
                     let bit_col: Vec<_> = column
-                        .iter()
+                        .phys_iter()
                         .map(|val| {
                             //val.map_or(false, |v| {
                             binary_map
                                 .get(&val.to_string())
-                                .map_or(false, |bits| bits[bit_pos])
+                                .is_some_and(|bits| bits[bit_pos])
                             //})
                         })
                         .collect();
                     //println!("{}, {}", column.len(), bit_col.len());
-                    out.hstack_mut(&[Series::new(column_name.into(), bit_col)])?;
+                    out.hstack_mut(&[Series::new(column_name.into(), bit_col).into()])?;
                 }
             }
-            if dtype == "Numeric" {
-                if col.len() == 0 {
+            if dtype == NUMERIC {
+                if col.is_empty() {
                     continue;
                 }
 
                 let mut nominal_classes: Vec<usize> = Vec::new();
                 let col = col.sort(SortOptions::default())?;
-                for val in column.iter() {
+                for val in column.phys_iter() {
                     let a = col.iter().position(|cut| val <= cut).unwrap_or(col.len());
                     nominal_classes.push(a);
                 }
@@ -274,14 +292,14 @@ impl Binarizer {
 
                 // Step 4: Create binary columns for each bit position
                 for bit_pos in 0..num_bits {
-                    let column_name = format!("{}_bit_{}", feature_name, bit_pos);
+                    let column_name = format!("{feature_name}_bit_{bit_pos}");
                     let bit_col: Vec<bool> = nominal_classes
                         .iter()
                         .map(|&class_idx| binary_map[&class_idx][bit_pos])
                         .collect();
 
                     // Add the bit column to the DataFrame
-                    out.hstack_mut(&[Series::new(column_name.into(), bit_col)])?;
+                    out.hstack_mut(&[Series::new(column_name.into(), bit_col).into()])?;
                 }
             } else {
                 //println!("{data_type} not supported yet. Skipping");
@@ -329,12 +347,20 @@ impl Binarizer {
         let mut best_score = 0.0;
         let mut best_scoring_value = None;
         let mut index_of_best_scoring_value = None;
-
-        for (idx, (s, l)) in sorted
+        let labels_for_sorted = labels
             .iter()
             .skip(start)
             .take(end - start)
-            .zip(labels.iter().skip(start).take(end - start))
+            .collect::<Vec<_>>();
+
+        let iterator_sorted = sorted
+            .phys_iter()
+            .skip(start)
+            .take(end - start)
+            .collect::<Vec<_>>();
+        for (idx, (s, l)) in iterator_sorted
+            .into_iter()
+            .zip(labels_for_sorted.into_iter())
             .skip(1)
             .enumerate()
         {

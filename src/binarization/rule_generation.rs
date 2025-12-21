@@ -1,5 +1,6 @@
+use core::f64;
 use std::cmp::Reverse;
-use std::{collections::HashSet, f64::consts::E};
+use std::collections::HashSet;
 
 use super::binarize::Binarizer;
 use itertools::Itertools;
@@ -14,9 +15,11 @@ use std::sync::mpsc;
 use std::thread;
 use std::time::Instant;
 
+use std::time::Duration;
+
 type Pattern = HashSet<(bool, usize)>;
 
-const STEP_SIZE: usize = 100000;
+const STEP_SIZE: usize = 100_000;
 
 #[derive(Clone)]
 pub struct RuleGenerator {
@@ -27,9 +30,6 @@ pub struct RuleGenerator {
     fallback_label: usize,
     features: Vec<String>,
     remaining: Vec<usize>,
-    deep: usize,
-    decay: Vec<f64>,
-    retention: Vec<f64>,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -39,9 +39,6 @@ struct RuleGeneratorSaver {
     fallback_label: usize,
     features: Vec<String>,
     remaining: Vec<usize>,
-    deep: usize,
-    decay: Vec<f64>,
-    retention: Vec<f64>,
     // Filenames for non-serializable parts.
     bin_json: String,
     labels_csv: String,
@@ -49,13 +46,7 @@ struct RuleGeneratorSaver {
 
 impl RuleGenerator {
     #[must_use]
-    pub fn new(
-        bin: &Binarizer,
-        max: usize,
-        deep: usize,
-        decay: Vec<f64>,
-        retention: Vec<f64>,
-    ) -> Self {
+    pub fn new(bin: &Binarizer, max: usize) -> Self {
         Self {
             bin: bin.clone(),
             max,
@@ -64,16 +55,13 @@ impl RuleGenerator {
             fallback_label: 0,
             features: Vec::new(),
             remaining: Vec::new(),
-            deep,
-            decay,
-            retention,
         }
     }
 
     pub fn save(self, json_path: &str, work_dir: &str) -> Result<(), Box<dyn Error>> {
         // Define file paths for the non-serializable fields.
-        let bin_json = format!("{}/binarizer.json", work_dir);
-        let labels_csv = format!("{}/labels.csv", work_dir);
+        let bin_json = format!("{work_dir}/binarizer.json");
+        let labels_csv = format!("{work_dir}/labels.csv");
 
         // Save the Binarizer.
         self.bin.save(&bin_json, work_dir)?;
@@ -81,7 +69,7 @@ impl RuleGenerator {
         // Save the labels Series to CSV.
         {
             let mut file = File::create(&labels_csv)?;
-            let mut df = DataFrame::new(unsafe { vec![self.labels.clone()] })?;
+            let mut df = DataFrame::new(vec![self.labels.clone().into()])?;
             CsvWriter::new(&mut file).finish(&mut df)?;
         }
 
@@ -92,9 +80,6 @@ impl RuleGenerator {
             fallback_label: self.fallback_label,
             features: self.features.clone(),
             remaining: self.remaining.clone(),
-            deep: self.deep,
-            decay: self.decay.clone(),
-            retention: self.retention.clone(),
             bin_json: bin_json.clone(),
             labels_csv: labels_csv.clone(),
         };
@@ -132,13 +117,10 @@ impl RuleGenerator {
                 bin,
                 max: saver.max,
                 rules: saver.rules,
-                labels,
+                labels: labels.as_materialized_series_maintain_scalar().rechunk(),
                 fallback_label: saver.fallback_label,
                 features: saver.features,
                 remaining: saver.remaining,
-                deep: saver.deep,
-                decay: saver.decay,
-                retention: saver.retention,
             },
         ))
     }
@@ -253,10 +235,10 @@ impl RuleGenerator {
         until: usize,
     ) -> PolarsResult<(Series, Series, DataFrame)> {
         // Create a channel for sending notification messages
-        let (tx, rx) = mpsc::channel::<String>();
+        let (_tx, rx) = mpsc::channel::<String>();
 
         // Spawn a thread to handle notifications
-        let notifier_handle = thread::spawn(move || {
+        let _notifier_handle = thread::spawn(move || {
             // Create the notification instance in the thread
             let mut handle = Notification::new()
                 .summary("Task Progress")
@@ -392,7 +374,7 @@ impl RuleGenerator {
         ))
     }
 
-    pub fn fit2(&mut self, data: &DataFrame, labels: &Series) -> PolarsResult<DataFrame> {
+    pub fn fit(&mut self, data: &DataFrame, labels: &Series) -> PolarsResult<DataFrame> {
         let features = data.get_column_names();
         self.features = features.iter().map(|&x| x.to_string()).collect();
         self.labels = labels.unique_stable()?;
@@ -435,15 +417,82 @@ impl RuleGenerator {
         let mut prime_patterns: Vec<(usize, Pattern, f64, usize)> = Vec::new();
         let mut flag = false;
 
-        let mut icount = 0;
+        let mut prev_loop_best_patterns: Vec<(Pattern, usize, usize)> =
+            vec![(HashSet::new(), 0, grouped_dfs.len())];
 
+        // let mut loop_counter = 0;
         loop {
-            icount += 1;
+            // loop_counter += 1;
+            // println!("Loop: {loop_counter}");
+
             let mut base_score = 0;
             let mut prev_degree_patterns: Vec<(Pattern, usize, usize)> =
-                unsafe { vec![(HashSet::new(), 0, grouped_dfs.len())] };
+                vec![(HashSet::new(), usize::MAX, grouped_dfs.len())];
             let mut found_at = max_features;
 
+            let remaining_shapes: Vec<_> = grouped_dfs.iter().map(|df| df.shape().0).collect();
+            let length = prev_loop_best_patterns.len();
+            let step = (length / STEP_SIZE).max(1);
+            prev_degree_patterns
+                .sort_by_key(|(pattern, score, tmp)| (pattern.len(), Reverse(*score), *tmp));
+            for (pattern_idx, (curr_pattern, score0, _tmp0)) in
+                prev_loop_best_patterns.clone().into_iter().enumerate()
+            {
+                if score0 <= base_score {
+                    // println!("{score0} <? {base_score} ");
+                    continue;
+                }
+                if pattern_idx % step == 0 {
+                    let msg = format!(
+                        "processing pattern: {}/{} at depth -1 with base {} {:?} {}",
+                        pattern_idx + 1,
+                        length,
+                        base_score,
+                        remaining_shapes,
+                        score0
+                    );
+                    // Send the message to the notification thread.
+                    let _ = tx.send(msg);
+                }
+                // thread::sleep(Duration::from_secs(1));
+                let max_idx = { curr_pattern.iter().map(|(_, a)| *a).max() };
+                for idx in max_idx.map(|x| x + 1).unwrap_or_default()..features.len() {
+                    for term in [true, false] {
+                        let mut next_pattern = curr_pattern.clone();
+                        if !next_pattern.insert((term, idx)) {
+                            continue;
+                        }
+
+                        let (counts, tmp) = self.count(&grouped_dfs, &next_pattern)?;
+
+                        let mut lens = grouped_dfs
+                            .iter()
+                            .map(|x| x.shape().0 as f64)
+                            .zip(counts.iter().map(|&x| x as f64))
+                            .map(|(l, c)| c / l)
+                            .collect::<Vec<_>>();
+
+                        let max_lens = lens.iter().cloned().reduce(f64::max).unwrap_or(f64::NAN);
+
+                        for len in lens.iter_mut() {
+                            *len /= max_lens;
+                        }
+
+                        if let Some(pos) = lens.iter().position(|&x| x == 1.0) {
+                            lens[pos] = 0.0;
+                        }
+
+                        let max_value = counts.iter().cloned().max().unwrap_or_default();
+
+                        if max_value < base_score {
+                            continue;
+                        }
+                        if max_value > base_score && tmp == 1 {
+                            base_score = max_value;
+                        }
+                    }
+                }
+            }
             for d in 1..=max_features {
                 let mut curr_degree_patterns = Vec::new();
                 let remaining_shapes: Vec<_> = grouped_dfs.iter().map(|df| df.shape().0).collect();
@@ -452,11 +501,23 @@ impl RuleGenerator {
                 let step = (length / STEP_SIZE).max(1);
                 let mut max_score = 0;
                 let mut d1 = None;
-                prev_degree_patterns
-                    .sort_by_key(|(pattern, score, tmp)| (pattern.len(), Reverse(*score), *tmp));
+                prev_degree_patterns.sort_by_key(|(pattern, score, tmp)| {
+                    (pattern.len(), *tmp != 1, Reverse(*score), *tmp)
+                });
                 for (pattern_idx, (curr_pattern, score0, tmp0)) in
                     prev_degree_patterns.into_iter().enumerate()
                 {
+                    if tmp0 == 0 || score0 < base_score {
+                        // println!("{score0} <? {base_score} ");
+                        continue;
+                    }
+
+                    curr_degree_patterns.push((curr_pattern.clone(), score0, tmp0));
+
+                    if tmp0 == 1 || (score0 == base_score && base_score != 0) {
+                        // println!("{score0} =? {base_score} != 0 ");
+                        continue;
+                    }
                     if pattern_idx % step == 0 {
                         let msg = format!(
                             "processing pattern: {}/{} at depth {} with base {} {:?} {} {}",
@@ -471,17 +532,6 @@ impl RuleGenerator {
                         // Send the message to the notification thread.
                         let _ = tx.send(msg);
                     }
-
-                    if tmp0 == 0 || score0 < base_score {
-                        continue;
-                    }
-
-                    curr_degree_patterns.push((curr_pattern.clone(), score0, tmp0));
-
-                    if tmp0 == 1 || (score0 == base_score && base_score != 0) {
-                        continue;
-                    }
-
                     if curr_pattern.len() == d - 1 {
                         if d1.is_none() {
                             d1 = Some(pattern_idx);
@@ -508,7 +558,8 @@ impl RuleGenerator {
                                     .map(|(l, c)| c / l)
                                     .collect::<Vec<_>>();
 
-                                let max_lens = lens.iter().cloned().fold(0. / 0., f64::max);
+                                let max_lens =
+                                    lens.iter().cloned().reduce(f64::max).unwrap_or(f64::NAN);
 
                                 for len in lens.iter_mut() {
                                     *len /= max_lens;
@@ -517,14 +568,6 @@ impl RuleGenerator {
                                 if let Some(pos) = lens.iter().position(|&x| x == 1.0) {
                                     lens[pos] = 0.0;
                                 }
-                                let n = lens.len() as f64;
-                                let mean = lens.iter().sum::<f64>() / n;
-
-                                // Calculate the variance (population standard deviation).
-                                let variance =
-                                    lens.iter().map(|&x| (x - mean).powi(2)).sum::<f64>() / n;
-
-                                let std_dev = variance.sqrt();
 
                                 let max_value = counts.iter().cloned().max().unwrap_or_default();
 
@@ -547,39 +590,41 @@ impl RuleGenerator {
                 // println!("{d}\n{curr_degree_patterns:?}\n");
                 prev_degree_patterns = curr_degree_patterns
                     .into_iter()
-                    .filter(|(_, a, _)| *a >= base_score)
+                    // .filter(|(_, a, _)| *a >= base_score)
                     .collect();
 
-                if max_score < base_score
-                    || found_at + 2 == d
-                    || (max_score < 2 * base_score && self.deep == 9)
-                {
+                if found_at + 2 == d {
                     println!("Early Break");
                     break;
                 }
             }
             let pattern = {
-                let prev_degree_patterns: Vec<_> = prev_degree_patterns
+                let best_patterns: Vec<_> = prev_degree_patterns
                     .iter()
                     .filter(|x| x.2 == 1)
                     .cloned()
                     .collect();
 
-                let len = prev_degree_patterns.len();
+                prev_loop_best_patterns = best_patterns.clone();
+
+                let best_pattern: Vec<_> = best_patterns
+                    .into_iter()
+                    .filter(|(_, a, _)| *a >= base_score)
+                    .collect();
+
+                let len = best_pattern.len();
                 match len {
                     0 => {
                         if flag {
-                            // println!("Breaking");
                             break;
-                        } else {
-                            flag = true;
-                            continue;
                         }
+                        flag = true;
+                        continue;
                     }
-                    1 => prev_degree_patterns[0].0.clone(),
+                    1 => best_pattern[0].0.clone(),
                     _ => {
-                        let mut p = prev_degree_patterns[0].clone();
-                        for i in prev_degree_patterns.iter().skip(1) {
+                        let mut p = best_pattern[0].clone();
+                        for i in best_pattern.iter().skip(1) {
                             if i.1 > p.1 || i.0.len() < p.0.len() {
                                 p = i.clone();
                             }
@@ -613,7 +658,7 @@ impl RuleGenerator {
                 continue;
             }
             let l = Series::new("target".into(), vec![self.labels.get(idx).unwrap(); len]);
-            let data = df.hstack(&[l])?;
+            let data = df.hstack(&[l.into()])?;
             remaning_data.vstack_mut(&data)?;
         }
 
@@ -626,9 +671,16 @@ impl RuleGenerator {
 
         Ok(remaning_data)
     }
-    pub fn fit(&mut self, data: &DataFrame, labels: &Series) -> PolarsResult<DataFrame> {
-        if self.deep >= 9 {
-            return self.fit2(data, labels);
+    pub fn fit_legacy(
+        &mut self,
+        data: &DataFrame,
+        labels: &Series,
+        deep: usize,
+        decay: Vec<f64>,
+        retention: Vec<f64>,
+    ) -> PolarsResult<DataFrame> {
+        if deep >= 9 {
+            return self.fit(data, labels);
         }
         let features = data.get_column_names();
         self.features = features.iter().map(|&x| x.to_string()).collect();
@@ -655,8 +707,7 @@ impl RuleGenerator {
             .show()
             .unwrap();
 
-        let mut prev_degree_patterns: Vec<(Pattern, usize, usize)> =
-            unsafe { vec![(HashSet::new(), 0, 2)] };
+        let mut prev_degree_patterns: Vec<(Pattern, usize, usize)> = vec![(HashSet::new(), 0, 2)];
 
         let mut prime_patterns: Vec<(usize, Pattern, f64, usize)> = Vec::new();
 
@@ -682,7 +733,7 @@ impl RuleGenerator {
                     ));
                     handle.update();
                 }
-                if (self.deep >> 2) % 2 == 1 {
+                if (deep >> 2) % 2 == 1 {
                     if tmp0 == 0 {
                         continue;
                     }
@@ -720,13 +771,12 @@ impl RuleGenerator {
                                     .iter()
                                     .enumerate()
                                     .filter(|(i, &x)| {
-                                        x as f64 / grouped_dfs[*i].shape().0 as f64 > self.decay[*i]
-                                            && x as f64 / covered as f64 >= self.retention[*i]
+                                        x as f64 / grouped_dfs[*i].shape().0 as f64 > decay[*i]
+                                            && x as f64 / covered as f64 >= retention[*i]
                                     })
                                     .max_by_key(|(i, &x)| {
-                                        if x as f64 / grouped_dfs[*i].shape().0 as f64
-                                            > self.decay[*i]
-                                            && x as f64 / covered as f64 >= self.retention[*i]
+                                        if x as f64 / grouped_dfs[*i].shape().0 as f64 > decay[*i]
+                                            && x as f64 / covered as f64 >= retention[*i]
                                         {
                                             x
                                         } else {
@@ -745,7 +795,7 @@ impl RuleGenerator {
                     }
                 }
             }
-            if (self.deep >> 2) % 2 == 0 || d == max_features {
+            if (deep >> 2) % 2 == 0 || d == max_features {
                 let mut count = 0u128;
                 loop {
                     curr_degree_patterns.sort_by_key(|(b, a, _t)| (*a, std::cmp::Reverse(b.len())));
@@ -790,12 +840,12 @@ impl RuleGenerator {
                             .iter()
                             .enumerate()
                             .filter(|(i, &x)| {
-                                x as f64 / grouped_dfs[*i].shape().0 as f64 > self.decay[*i]
-                                    && x as f64 / covered as f64 >= self.retention[*i]
+                                x as f64 / grouped_dfs[*i].shape().0 as f64 > decay[*i]
+                                    && x as f64 / covered as f64 >= retention[*i]
                             })
                             .max_by_key(|(i, &x)| {
-                                if x as f64 / grouped_dfs[*i].shape().0 as f64 > self.decay[*i]
-                                    && x as f64 / covered as f64 >= self.retention[*i]
+                                if x as f64 / grouped_dfs[*i].shape().0 as f64 > decay[*i]
+                                    && x as f64 / covered as f64 >= retention[*i]
                                 {
                                     x
                                 } else {
@@ -810,7 +860,7 @@ impl RuleGenerator {
                         }
 
                         max_score_at = ((msa, *score1), i);
-                        let o = self.deep % 4 > 1 && flags.iter().any(|&x| x);
+                        let o = deep % 4 > 1 && flags.iter().any(|&x| x);
 
                         let len = grouped_dfs[max_score_at.0 .0].shape().0;
                         if tmp == 1 && !o
@@ -834,7 +884,7 @@ impl RuleGenerator {
                             curr_degree_patterns[i].1 = max_score_at.0 .1;
                             curr_degree_patterns[i].2 = tmp;
                         }
-                        if self.deep % 4 == 2 && flags.iter().any(|&x| x) {
+                        if deep % 4 == 2 && flags.iter().any(|&x| x) {
                             break;
                         }
                     }
@@ -845,7 +895,7 @@ impl RuleGenerator {
                     if flags.iter().all(|x| !*x) {
                         break;
                     }
-                    if self.deep % 4 == 0 {
+                    if deep % 4 == 0 {
                         break;
                     }
                 }
@@ -886,7 +936,7 @@ impl RuleGenerator {
                 continue;
             }
             let l = Series::new("target".into(), vec![self.labels.get(idx).unwrap(); len]);
-            let data = df.hstack(&[l])?;
+            let data = df.hstack(&[l.into()])?;
             remaning_data.vstack_mut(&data)?;
         }
 
@@ -901,7 +951,6 @@ impl RuleGenerator {
         grouped_dfs: &Vec<DataFrame>,
         pattern: &Pattern,
     ) -> PolarsResult<(Vec<usize>, usize)> {
-        let lens: Vec<_> = grouped_dfs.iter().map(|df| df.shape().0).collect();
         let counts: Vec<usize> = grouped_dfs
             .par_iter()
             .map(|df| {
@@ -910,16 +959,7 @@ impl RuleGenerator {
             })
             .collect::<PolarsResult<Vec<_>>>()?;
 
-        let tmp = counts
-            .iter()
-            .zip(lens.iter())
-            .zip(self.decay.iter())
-            .filter(|((&x, &l), &d)| {
-                // print!("{x}, {l}, {d}\n");
-                x as f64 / l as f64 > d
-            })
-            .count();
-        // println!("{tmp}");
+        let tmp = counts.iter().filter(|&x| *x > 0).count();
         Ok((counts, tmp))
     }
 
