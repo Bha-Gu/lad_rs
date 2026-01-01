@@ -17,8 +17,6 @@ use std::sync::mpsc;
 use std::thread;
 use std::time::Instant;
 
-use std::time::Duration;
-
 type Pattern = HashSet<(bool, usize)>;
 
 const STEP_SIZE: usize = 100_000;
@@ -32,6 +30,7 @@ pub struct RuleGenerator {
     fallback_label: usize,
     features: Vec<String>,
     remaining: Vec<usize>,
+    depth_searched: usize,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -44,6 +43,7 @@ struct RuleGeneratorSaver {
     // Filenames for non-serializable parts.
     bin_json: String,
     labels_csv: String,
+    deapth_searched: usize,
 }
 
 impl RuleGenerator {
@@ -57,6 +57,7 @@ impl RuleGenerator {
             fallback_label: 0,
             features: Vec::new(),
             remaining: Vec::new(),
+            depth_searched: 0,
         }
     }
 
@@ -81,9 +82,10 @@ impl RuleGenerator {
             rules: self.rules.clone(),
             fallback_label: self.fallback_label,
             features: self.features.clone(),
-            remaining: self.remaining.clone(),
-            bin_json: bin_json.clone(),
-            labels_csv: labels_csv.clone(),
+            remaining: self.remaining,
+            bin_json,
+            labels_csv,
+            deapth_searched: self.depth_searched,
         };
 
         let file = File::create(json_path)?;
@@ -93,10 +95,7 @@ impl RuleGenerator {
     }
 
     // Load RuleGenerator: reads the JSON file, then loads the Binarizer and labels Series.
-    pub fn load(
-        json_path: &str,
-        work_dir: &str,
-    ) -> Result<(Binarizer, RuleGenerator), Box<dyn Error>> {
+    pub fn load(json_path: &str, work_dir: &str) -> Result<(Binarizer, Self), Box<dyn Error>> {
         let file = File::open(json_path)?;
         let reader = BufReader::new(file);
         let saver: RuleGeneratorSaver = serde_json::from_reader(reader)?;
@@ -115,7 +114,7 @@ impl RuleGenerator {
 
         Ok((
             bin.clone(),
-            RuleGenerator {
+            Self {
                 bin,
                 max: saver.max,
                 rules: saver.rules,
@@ -123,6 +122,7 @@ impl RuleGenerator {
                 fallback_label: saver.fallback_label,
                 features: saver.features,
                 remaining: saver.remaining,
+                depth_searched: saver.deapth_searched,
             },
         ))
     }
@@ -200,7 +200,7 @@ impl RuleGenerator {
                 .map(|((_, prediction), rule_idx)| (prediction, rule_idx))
                 .for_each(|(prediction, rile_idx)| {
                     *prediction = Some(*label);
-                    *rile_idx = Some(idx)
+                    *rile_idx = Some(idx);
                 });
         }
 
@@ -306,7 +306,7 @@ impl RuleGenerator {
                 .map(|((_, prediction), rule_idx)| (prediction, rule_idx))
                 .for_each(|(prediction, rile_idx)| {
                     *prediction = Some(*label);
-                    *rile_idx = Some(idx)
+                    *rile_idx = Some(idx);
                 });
         }
 
@@ -377,6 +377,179 @@ impl RuleGenerator {
             ),
             data,
         ))
+    }
+
+    pub fn fit_new(&mut self, data: &DataFrame, labels: &Series) -> PolarsResult<DataFrame> {
+        let features = data.get_column_names();
+        self.features = features.iter().map(|&x| x.to_string()).collect();
+        self.labels = labels.unique_stable()?;
+
+        let mut grouped_dfs: Vec<DataFrame> = self.divide_data(data, labels);
+
+        self.fallback_label = grouped_dfs
+            .iter()
+            .enumerate()
+            .max_by_key(|(_, df)| df.shape().0)
+            .map(|(i, _)| i)
+            .unwrap_or_default();
+
+        let max_features = if self.max > features.len() || self.max == 0 {
+            features.len()
+        } else {
+            self.max
+        };
+
+        // Create a channel for sending notification messages
+        let (tx, rx) = mpsc::channel::<String>();
+
+        // Spawn a thread to handle notifications
+        let notifier_handle = thread::spawn(move || {
+            // Create the notification instance in the thread
+            let mut handle = Notification::new()
+                .summary("Task Progress")
+                .body("Task is starting")
+                .show()
+                .unwrap();
+
+            // Loop and update notifications as messages are received.
+            #[cfg(not(target_os = "windows"))]
+            {
+                for msg in rx {
+                    handle.body(&msg);
+                    handle.update();
+                }
+            }
+        });
+
+        let mut base_patterns = Vec::new();
+
+        for i in 0..self.features.len() {
+            for b in [true, false] {
+                let mut pattern = HashSet::new();
+                pattern.insert((b, i));
+                let (count, tmp) = self.count(&grouped_dfs, &pattern)?;
+                if tmp == 0 {
+                    continue;
+                }
+
+                let max_count = count.iter().copied().max().unwrap_or_default();
+
+                base_patterns.push(pattern);
+            }
+        }
+
+        let mut potential_patterns = Vec::new();
+
+        let mut one_patterns = base_patterns.clone();
+
+        for complexity in 0..max_features {
+            let mut flag = false;
+            let remaining_shapes = grouped_dfs.iter().map(|x| x.shape().0).collect::<Vec<_>>();
+            loop {
+                flag = true;
+
+                let mut masks: Option<Vec<Vec<bool>>> = None;
+                let base_len = base_patterns.len();
+                let base_iter = base_patterns.into_iter();
+                base_patterns = Vec::new();
+
+                for (pattern_idx, p) in base_iter.enumerate() {
+                    let msg = format!(
+                        "processing pattern: {}/{} at depth {} with {:?}",
+                        pattern_idx + 1,
+                        base_len,
+                        complexity + 1,
+                        remaining_shapes,
+                    );
+                    // Send the message to the notification thread.
+                    let _ = tx.send(msg);
+
+                    let (count, tmp) = self.count(&grouped_dfs, &p)?;
+                    if tmp == 0 {
+                        continue;
+                    }
+
+                    let max_count = count.iter().copied().max().unwrap_or_default();
+
+                    if tmp == 1 {
+                        let mut tmp_masks = Vec::new();
+                        for df in &grouped_dfs {
+                            let mask = self.coverage(df, &p)?;
+                            tmp_masks.push(mask);
+                        }
+
+                        masks = if let Some(masks) = masks {
+                            Some(
+                                masks
+                                    .into_iter()
+                                    .zip(tmp_masks.into_iter())
+                                    .map(|(m, t)| {
+                                        m.into_iter()
+                                            .zip(t.into_iter())
+                                            .map(|(mm, tt)| mm || tt)
+                                            .collect::<Vec<_>>()
+                                    })
+                                    .collect::<Vec<_>>(),
+                            )
+                        } else {
+                            Some(tmp_masks)
+                        };
+                        flag = false;
+                        potential_patterns.push((p, max_count, tmp));
+                    } else {
+                        base_patterns.push(p);
+                    }
+                }
+
+                if flag {
+                    break;
+                }
+
+                if let Some(masks) = masks {
+                    for (m, df) in masks.iter().zip(grouped_dfs.iter_mut()) {
+                        *df = df.filter(&m.into_iter().map(|x| !x).collect())?;
+                    }
+                }
+            }
+
+            if complexity == 0 {
+                one_patterns = base_patterns.clone();
+            }
+
+            if complexity < max_features - 1 {
+                let base_iter = base_patterns.into_iter();
+                base_patterns = Vec::new();
+                for b in base_iter {
+                    for o in &one_patterns {
+                        let pattern: HashSet<_> = b.union(o).copied().collect();
+                        if pattern.len() < b.len() {
+                            continue;
+                        }
+                        base_patterns.push(pattern)
+                    }
+                }
+            }
+        }
+
+        self.rules = potential_patterns
+            .into_iter()
+            .enumerate()
+            .map(|(i, p)| (i, p.0, p.1 as f64, p.2))
+            .collect();
+
+        let mut remaning_data = DataFrame::empty();
+
+        for (idx, df) in grouped_dfs.into_iter().enumerate() {
+            let len = df.shape().0;
+            if len == 0 {
+                continue;
+            }
+            let l = Series::new("target".into(), vec![self.labels.get(idx).unwrap(); len]);
+            let data = df.hstack(&[l.into()])?;
+            remaning_data.vstack_mut(&data)?;
+        }
+
+        Ok(remaning_data)
     }
 
     pub fn fit(&mut self, data: &DataFrame, labels: &Series) -> PolarsResult<DataFrame> {
@@ -480,9 +653,9 @@ impl RuleGenerator {
                             .map(|(l, c)| c / l)
                             .collect::<Vec<_>>();
 
-                        let max_lens = lens.iter().cloned().reduce(f64::max).unwrap_or(f64::NAN);
+                        let max_lens = lens.iter().copied().reduce(f64::max).unwrap_or(f64::NAN);
 
-                        for len in lens.iter_mut() {
+                        for len in &mut lens {
                             *len /= max_lens;
                         }
 
@@ -490,7 +663,7 @@ impl RuleGenerator {
                             lens[pos] = 0.0;
                         }
 
-                        let max_value = counts.iter().cloned().max().unwrap_or_default();
+                        let max_value = counts.iter().copied().max().unwrap_or_default();
 
                         if max_value < base_score {
                             continue;
@@ -559,25 +732,8 @@ impl RuleGenerator {
                                 if tmp == 0 {
                                     continue;
                                 }
-                                let mut lens = grouped_dfs
-                                    .iter()
-                                    .map(|x| x.shape().0 as f64)
-                                    .zip(counts.iter().map(|&x| x as f64))
-                                    .map(|(l, c)| c / l)
-                                    .collect::<Vec<_>>();
 
-                                let max_lens =
-                                    lens.iter().cloned().reduce(f64::max).unwrap_or(f64::NAN);
-
-                                for len in lens.iter_mut() {
-                                    *len /= max_lens;
-                                }
-
-                                if let Some(pos) = lens.iter().position(|&x| x == 1.0) {
-                                    lens[pos] = 0.0;
-                                }
-
-                                let max_value = counts.iter().cloned().max().unwrap_or_default();
+                                let max_value = counts.iter().copied().max().unwrap_or_default();
 
                                 if max_value < base_score {
                                     continue;
@@ -613,7 +769,7 @@ impl RuleGenerator {
                     .cloned()
                     .collect();
 
-                prev_loop_best_patterns = best_patterns.clone();
+                prev_loop_best_patterns.clone_from(&best_patterns);
 
                 let best_pattern: Vec<_> = best_patterns
                     .into_iter()
@@ -684,8 +840,8 @@ impl RuleGenerator {
         data: &DataFrame,
         labels: &Series,
         deep: usize,
-        decay: Vec<f64>,
-        retention: Vec<f64>,
+        decay: &[f64],
+        retention: &[f64],
     ) -> PolarsResult<DataFrame> {
         if deep >= 9 {
             return self.fit(data, labels);
@@ -922,7 +1078,7 @@ impl RuleGenerator {
                 let remaining_shapes: Vec<_> = grouped_dfs.iter().map(|df| df.shape().0).collect();
                 println!("{remaining_shapes:?} {count}");
 
-                self.remaining = remaining_shapes.clone();
+                self.remaining.clone_from(&remaining_shapes);
 
                 if remaining_shapes.into_iter().sum::<usize>() == 0 {
                     break;
@@ -1025,16 +1181,16 @@ impl RuleGenerator {
             // If it's the first iteration, set the mask to the current one
             mask.iter_mut().zip(current_mask).for_each(|(a, b)| {
                 if b {
-                    *a += 1.
+                    *a += 1.;
                 }
             });
         }
 
-        mask.iter_mut().for_each(|a| {
+        for a in &mut mask {
             if len != 0. {
-                *a /= len
+                *a /= len;
             }
-        });
+        }
 
         Ok(mask)
     }
