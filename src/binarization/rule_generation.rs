@@ -1,6 +1,7 @@
 use core::f64;
 use std::cmp::Reverse;
 use std::collections::HashSet;
+use std::ops::Index;
 
 use super::binarize::Binarizer;
 use itertools::Itertools;
@@ -471,6 +472,8 @@ impl RuleGenerator {
 
                     let max_count = count.iter().copied().max().unwrap_or_default();
 
+                    let index = count.iter().find(|c| **c == max_count).unwrap().to_owned();
+
                     if tmp == 1 {
                         let mut tmp_masks = Vec::new();
                         for df in &grouped_dfs {
@@ -495,7 +498,7 @@ impl RuleGenerator {
                             Some(tmp_masks)
                         };
                         flag = false;
-                        potential_patterns.push((p, max_count, tmp));
+                        potential_patterns.push((index, p, max_count, tmp));
                     } else {
                         base_patterns.push(p);
                     }
@@ -533,8 +536,7 @@ impl RuleGenerator {
 
         self.rules = potential_patterns
             .into_iter()
-            .enumerate()
-            .map(|(i, p)| (i, p.0, p.1 as f64, p.2))
+            .map(|p| (p.0, p.1, p.2 as f64, p.3))
             .collect();
 
         let mut remaning_data = DataFrame::empty();
