@@ -445,10 +445,10 @@ impl RuleGenerator {
 
         for complexity in 0..max_features {
             let mut flag = false;
-            let remaining_shapes = grouped_dfs.iter().map(|x| x.shape().0).collect::<Vec<_>>();
             loop {
                 flag = true;
 
+                let remaining_shapes = grouped_dfs.iter().map(|x| x.shape().0).collect::<Vec<_>>();
                 let mut masks: Option<Vec<Vec<bool>>> = None;
                 let base_len = base_patterns.len();
                 let base_iter = base_patterns.into_iter();
