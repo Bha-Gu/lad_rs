@@ -1,36 +1,118 @@
-use std::{cmp::Ordering, collections::HashMap};
-
 use polars::prelude::*;
+use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
+use std::error::Error;
+use std::fs::File;
+use std::io::{BufReader, BufWriter};
 
 #[derive(Clone)]
 pub struct Binarizer {
-    cutpoints: Vec<Series>,
+    /// List of all cutpoints or unique values as per datatypes of the column
+    sorted_cutpoints: Vec<Series>,
+    /// Minimum score for splits to be accepted
+    pub threshold: f64,
+    /// Maximum number of unique numerical values for it to be considered Nominal Data Type
+    numeric_as_nominal_upper_threshold: usize,
+    /// Limit the number of cutpoints for every column
+    max_cutpoints_for_column: usize,
+    /// Limit the number of time a column is split
+    search_depth: usize,
+}
+
+///Private struct to help save to file
+#[derive(Clone, Serialize, Deserialize)]
+struct BinSaver {
     pub threshold: f64,
     nominal_size: usize,
     max_cutpoints: usize,
     depth: usize,
+    num_cutpoints: usize,
 }
+
+static BOOL: &str = "Bool";
+static NOMINAL: &str = "Nominal";
+static NUMERIC: &str = "Numeric";
 
 impl Binarizer {
     #[must_use]
-    pub fn new(
+    pub const fn new(
         threshold: f64,
         nominal_size: usize,
         max_cutpoints_per_column: usize,
         depth: usize,
     ) -> Self {
         Self {
-            cutpoints: Vec::new(),
+            sorted_cutpoints: Vec::new(),
             threshold,
-            nominal_size,
-            max_cutpoints: max_cutpoints_per_column,
-            depth,
+            numeric_as_nominal_upper_threshold: nominal_size,
+            max_cutpoints_for_column: max_cutpoints_per_column,
+            search_depth: depth,
         }
+    }
+
+    pub fn save(self, json_path: &str, csv_dir: &str) -> Result<(), Box<dyn Error>> {
+        // Save each Series as a CSV file named "cutpoints_{i}.csv"
+        for (i, series) in self.sorted_cutpoints.iter().enumerate() {
+            let file_path = format!("{csv_dir}/cutpoints_{i}.csv");
+            let mut file = File::create(&file_path)?;
+            // Wrap the Series in a DataFrame so that we can write it as CSV.
+            let mut df = DataFrame::new(vec![series.clone().into()])?;
+            CsvWriter::new(&mut file).finish(&mut df)?;
+        }
+
+        // Create a dummy struct to hold the other fields.
+        let saver = BinSaver {
+            threshold: self.threshold,
+            nominal_size: self.numeric_as_nominal_upper_threshold,
+            max_cutpoints: self.max_cutpoints_for_column,
+            depth: self.search_depth,
+            num_cutpoints: self.sorted_cutpoints.len(),
+        };
+
+        let file = File::create(json_path)?;
+        let writer = BufWriter::new(file);
+        serde_json::to_writer(writer, &saver)?;
+        Ok(())
+    }
+
+    // Load function:
+    // - Reads the BinSaver from the JSON file to recover non-Series fields.
+    // - Loads each CSV file (assumed named "cutpoints_{i}.csv") to reconstruct the Series vector.
+    pub fn load(json_path: &str, csv_dir: &str) -> Result<Self, Box<dyn Error>> {
+        // Load the dummy struct from JSON.
+        let file = File::open(json_path)?;
+        let reader = BufReader::new(file);
+        let saver: BinSaver = serde_json::from_reader(reader)?;
+
+        // Read the Series CSV files.
+        let mut cutpoints = Vec::with_capacity(saver.num_cutpoints);
+        for i in 0..saver.num_cutpoints {
+            let file_path = format!("{csv_dir}/cutpoints_{i}.csv");
+            let file = File::open(file_path)?;
+            let df = CsvReader::new(file).finish()?;
+            // Assuming each CSV file contains one column, we extract it.
+            let series = df
+                .select_at_idx(0)
+                .ok_or_else(|| format!("No column found in CSV cutpoints_{i}.csv"))?
+                .as_materialized_series()
+                .clone()
+                .rechunk();
+            cutpoints.push(series);
+        }
+
+        // Reconstruct the full Binarizer.
+        Ok(Self {
+            sorted_cutpoints: cutpoints,
+            threshold: saver.threshold,
+            numeric_as_nominal_upper_threshold: saver.nominal_size,
+            max_cutpoints_for_column: saver.max_cutpoints,
+            search_depth: saver.depth,
+        })
     }
 
     #[must_use]
     pub fn get_cutpoints(&self) -> Vec<Series> {
-        self.cutpoints.clone()
+        self.sorted_cutpoints.clone()
     }
 
     pub fn generate_cutpoints(
@@ -40,44 +122,35 @@ impl Binarizer {
     ) -> Result<(), PolarsError> {
         if data.shape().0 != label.len() {
             println!(
-                "Lengths of data {} and label {} do not match",
+                "Lengths of data ({}) and label ({}) do not match",
                 data.shape().0,
                 label.len()
             );
             return Ok(());
         }
         let schema = data.schema();
-        self.cutpoints = Vec::new();
-        let unique_labels = label.unique_stable()?;
-        let mut label_counts = vec![0u128; unique_labels.len()];
-        for l in label.iter() {
-            for (j, lj) in unique_labels.iter().enumerate() {
-                if lj == l {
-                    label_counts[j] += 1;
-                    break;
-                }
-            }
-        }
+        self.sorted_cutpoints = Vec::new();
+        let unique_classes = label.unique_stable()?;
 
-        let label_counts = label_counts;
         for (idx, (feature_name, data_type)) in schema.iter().enumerate() {
             let column = data[idx].clone();
             let a = column.n_unique().unwrap_or_default();
-            if a == 2 || data_type.is_bool() {
-                let unique_values = column.unique_stable()?;
+            let is_bool_type = a == 2 || data_type.is_bool();
+            let is_nominal_type =
+                a <= self.numeric_as_nominal_upper_threshold || data_type.is_string();
+            if is_bool_type || is_nominal_type {
+                let unique_values = column
+                    .unique_stable()?
+                    .as_materialized_series()
+                    .clone()
+                    .rechunk();
 
-                self.cutpoints.push(Series::new(
-                    format!("Bool#{}", feature_name).into(),
-                    unique_values,
-                ));
-
-                continue;
-            }
-            if a <= self.nominal_size || data_type.is_string() {
-                let unique_values = column.unique_stable()?;
-
-                self.cutpoints.push(Series::new(
-                    format!("Nominal#{}", feature_name).into(),
+                self.sorted_cutpoints.push(Series::new(
+                    if is_bool_type {
+                        format!("{BOOL}#{feature_name}").into()
+                    } else {
+                        format!("{NOMINAL}#{feature_name}").into()
+                    },
                     unique_values,
                 ));
 
@@ -85,25 +158,23 @@ impl Binarizer {
             }
 
             if data_type.is_numeric() {
-                let mut column_and_label = DataFrame::new(vec![label.clone(), column])?;
-                let mut running_counts = vec![0u128; unique_labels.len()];
+                let mut column_and_label = DataFrame::new(vec![label.clone().into(), column])?;
+
                 column_and_label = column_and_label
                     .sort([feature_name.to_string()], SortMultipleOptions::default())?;
-                let mut cps = Vec::new();
-                let sorted = column_and_label.drop_in_place(feature_name.as_ref())?;
-                let labels = column_and_label.drop_in_place(label.name().as_ref())?;
-                let mut prev_label = labels.get(0)?;
-                let mut prev_value = sorted.get(0)?;
-                running_counts[unsafe {
-                    unique_labels
-                        .iter()
-                        .position(|x| x == prev_label)
-                        .unwrap_unchecked()
-                }] += 1;
+                let mut cutpoints = Vec::new();
+                let sorted = column_and_label
+                    .drop_in_place(feature_name.as_ref())?
+                    .as_materialized_series_maintain_scalar()
+                    .rechunk();
+                let labels = column_and_label
+                    .drop_in_place(label.name().as_ref())?
+                    .as_materialized_series_maintain_scalar()
+                    .rechunk();
 
                 let mut segments = vec![(0, sorted.len())]; // Start with the full range
 
-                for _ in 0..self.depth {
+                for _ in 0..self.search_depth {
                     let mut new_segments = Vec::new();
 
                     for &(start, end) in &segments {
@@ -114,9 +185,9 @@ impl Binarizer {
                             end,
                             &sorted,
                             &labels,
-                            &unique_labels,
+                            &unique_classes,
                             data_type,
-                            &mut cps,
+                            &mut cutpoints,
                         )? {
                             // Create two new segments based on the split point
                             new_segments.push((start, split_idx));
@@ -128,18 +199,9 @@ impl Binarizer {
                     segments = new_segments;
                 }
 
-                let cps = cps
-                    .iter()
-                    //.rev()
-                    //.take(self.max_cutpoints)
-                    .map(|(x, _s)| {
-                        //print!("{s} ");
-                        x.to_owned()
-                    })
-                    .collect::<Vec<_>>();
-                //println!();
-                self.cutpoints
-                    .push(Series::new(format!("Numeric#{}", feature_name).into(), cps));
+                let cps = cutpoints.into_iter().map(|(x, _s)| x).collect::<Vec<_>>();
+                self.sorted_cutpoints
+                    .push(Series::new(format!("{NUMERIC}#{feature_name}").into(), cps));
             }
         }
         Ok(())
@@ -149,13 +211,13 @@ impl Binarizer {
         let mut out = DataFrame::default();
 
         let names = self
-            .cutpoints
+            .sorted_cutpoints
             .iter()
             .map(|x| (unsafe { x.name().split_once('#').unwrap_unchecked() }, x));
 
         for ((dtype, feature_name), col) in names {
             let column = df.column(feature_name)?;
-            if dtype == "Bool" {
+            if dtype == BOOL {
                 let value = col.get(0)?;
                 out.hstack_mut(&[Series::new(
                     format!(
@@ -166,15 +228,21 @@ impl Binarizer {
                         }
                     )
                     .into(),
-                    column.iter().map(|x| x == value).collect::<Vec<_>>(),
-                )])?;
+                    column.phys_iter().map(|x| x == value).collect::<Vec<_>>(),
+                )
+                .into()])?;
                 continue;
             }
 
-            if dtype == "Nominal" {
+            if dtype == NOMINAL {
                 let unique_values: Vec<_> = col.iter().collect();
-                let n = unique_values.len();
-                let num_bits = (n as f64).log2().ceil() as usize;
+                let number_of_unique_values = unique_values.len();
+
+                let num_bits = if number_of_unique_values <= 1 {
+                    0
+                } else {
+                    usize::BITS as usize - (number_of_unique_values - 1).leading_zeros() as usize
+                };
 
                 // Step 2: Map each unique value to a binary representation
                 let mut binary_map = HashMap::new();
@@ -186,36 +254,45 @@ impl Binarizer {
 
                 // Step 3: Create columns based on binary representation
                 for bit_pos in 0..num_bits {
-                    let column_name = format!("{}_bit_{}", feature_name, bit_pos);
+                    let column_name = format!("{feature_name}_bit_{bit_pos}");
                     let bit_col: Vec<_> = column
-                        .iter()
+                        .phys_iter()
                         .map(|val| {
                             //val.map_or(false, |v| {
                             binary_map
                                 .get(&val.to_string())
-                                .map_or(false, |bits| bits[bit_pos])
+                                .is_some_and(|bits| bits[bit_pos])
                             //})
                         })
                         .collect();
                     //println!("{}, {}", column.len(), bit_col.len());
-                    out.hstack_mut(&[Series::new(column_name.into(), bit_col)])?;
+                    out.hstack_mut(&[Series::new(column_name.into(), bit_col).into()])?;
                 }
             }
-            if dtype == "Numeric" {
-                if col.len() == 0 {
+            if dtype == NUMERIC {
+                if col.is_empty() {
                     continue;
                 }
 
                 let mut nominal_classes: Vec<usize> = Vec::new();
                 let col = col.sort(SortOptions::default())?;
-                for val in column.iter() {
-                    let a = col.iter().position(|cut| val <= cut).unwrap_or(col.len());
+                for val in column.phys_iter() {
+                    let a = col
+                        .iter()
+                        .position(|cut| val <= cut)
+                        .unwrap_or_else(|| col.len());
                     nominal_classes.push(a);
                 }
 
                 // Step 2: Determine bit length needed for encoding classes
                 let n_classes = col.len() + 1; // One class for each cutpoint range, plus one for values above the last cutpoint
-                let num_bits = (n_classes as f64).log2().ceil() as usize;
+
+                let num_bits = if n_classes <= 1 {
+                    0
+                } else {
+                    usize::BITS as usize - (n_classes - 1).leading_zeros() as usize
+                };
+
                 // Step 3: Map each class to a binary code
                 let mut binary_map = HashMap::new();
                 for i in 0..n_classes {
@@ -226,14 +303,14 @@ impl Binarizer {
 
                 // Step 4: Create binary columns for each bit position
                 for bit_pos in 0..num_bits {
-                    let column_name = format!("{}_bit_{}", feature_name, bit_pos);
+                    let column_name = format!("{feature_name}_bit_{bit_pos}");
                     let bit_col: Vec<bool> = nominal_classes
                         .iter()
                         .map(|&class_idx| binary_map[&class_idx][bit_pos])
                         .collect();
 
                     // Add the bit column to the DataFrame
-                    out.hstack_mut(&[Series::new(column_name.into(), bit_col)])?;
+                    out.hstack_mut(&[Series::new(column_name.into(), bit_col).into()])?;
                 }
             } else {
                 //println!("{data_type} not supported yet. Skipping");
@@ -252,13 +329,13 @@ impl Binarizer {
         data_type: &'a DataType,
         cps: &mut Vec<(AnyValue<'a>, f64)>,
     ) -> PolarsResult<Option<usize>> {
-        //println!("{start} {end}");
-        let mut running_counts = vec![0u128; unique_labels.len()];
-        let mut label_counts = vec![0u128; unique_labels.len()];
+        let mut sample_count_until_currently_considered_cutpoint_per_class =
+            vec![0u128; unique_labels.len()];
+        let mut sample_count_per_class = vec![0u128; unique_labels.len()];
         for l in start..end {
             for (j, lj) in unique_labels.iter().enumerate() {
                 if lj == labels.get(l)? {
-                    label_counts[j] += 1;
+                    sample_count_per_class[j] += 1;
                     break;
                 }
             }
@@ -268,12 +345,10 @@ impl Binarizer {
             return Ok(None);
         }
 
-        //println!("{sorted:?}\n{labels:?}");
-
-        let label_counts = label_counts;
+        let sample_count_per_class = sample_count_per_class;
         let mut prev_label = labels.get(start)?;
         let mut prev_value = sorted.get(start)?;
-        running_counts[unsafe {
+        sample_count_until_currently_considered_cutpoint_per_class[unsafe {
             unique_labels
                 .iter()
                 .position(|x| x == prev_label)
@@ -281,112 +356,81 @@ impl Binarizer {
         }] += 1;
 
         let mut best_score = 0.0;
-        let mut best_value = None;
-        let mut best_index = None;
-
-        for (idx, (s, l)) in sorted
+        let mut best_scoring_value = None;
+        let mut index_of_best_scoring_value = None;
+        let labels_for_sorted = labels
             .iter()
             .skip(start)
             .take(end - start)
-            .zip(labels.iter().skip(start).take(end - start))
+            .collect::<Vec<_>>();
+
+        let iterator_sorted = sorted
+            .phys_iter()
+            .skip(start)
+            .take(end - start)
+            .collect::<Vec<_>>();
+        for (idx, (s, l)) in iterator_sorted
+            .into_iter()
+            .zip(labels_for_sorted.into_iter())
             .skip(1)
             .enumerate()
         {
-            let score = Self::score(&running_counts, &label_counts);
-            //println!("{score:?} {best_score} {best_value:?} {best_index:?}");
-            running_counts
-                [unsafe { unique_labels.iter().position(|x| x == l).unwrap_unchecked() }] += 1;
+            if prev_label != l {
+                let score = Self::score(
+                    &sample_count_until_currently_considered_cutpoint_per_class,
+                    &sample_count_per_class,
+                );
+                sample_count_until_currently_considered_cutpoint_per_class
+                    [unsafe { unique_labels.iter().position(|x| x == l).unwrap_unchecked() }] += 1;
 
-            if prev_value != s {
-                //println!("inside  {score:?} {best_score} {prev_value} {s}");
-                if score >= self.threshold && score > best_score {
+                if prev_value != s && score >= self.threshold && score > best_score {
                     best_score = score;
-                    best_value = Some(unsafe {
+                    best_scoring_value = Some(unsafe {
                         Series::new("tmp".into(), [s.clone(), prev_value])
                             .mean()
                             .unwrap_unchecked()
                     });
-                    best_index = Some(idx + start + 1);
+                    index_of_best_scoring_value = Some(idx + start + 1);
                 }
-                prev_value = s;
             }
-
+            prev_value = s;
             prev_label = l;
         }
 
-        if let Some(value) = best_value {
+        if let Some(value) = best_scoring_value {
             cps.push((AnyValue::from(value).cast(data_type), best_score));
         }
 
-        Ok(best_index)
+        Ok(index_of_best_scoring_value)
     }
 
+    #[allow(clippy::cast_precision_loss)]
     pub fn score(runner: &[u128], total: &[u128]) -> f64 {
         #[allow(clippy::cast_precision_loss)]
-        let rates = runner
+        let classwise_coverage_before_cutpoint = runner
             .iter()
             .zip(total.iter())
             .map(|(&r, &t)| r as f64 / t as f64)
             .collect::<Vec<_>>();
 
-        let len = rates.len();
+        let number_of_classes = classwise_coverage_before_cutpoint.len();
 
         let mut out = 0.0;
 
-        for i in 0..len {
-            for j in (i + 1)..len {
-                let tmp = rates[i] - rates[j];
+        for i in 0..number_of_classes {
+            for j in (i + 1)..number_of_classes {
+                let tmp =
+                    classwise_coverage_before_cutpoint[i] - classwise_coverage_before_cutpoint[j];
                 out += tmp * tmp;
             }
         }
 
-        let len = len as f64;
+        let max = find_max(number_of_classes);
 
-        let max = (len * len - (rates.len() % 2) as f64) / 4.;
-
-        f64::sqrt(out / max)
-
-        //let sum = rates.iter().sum::<f64>();
-        //
-        //
-        //
-        //#[allow(clippy::cast_precision_loss)]
-        //let score = rates.iter().map(|x| x * (sum - x)).sum::<f64>() / (runner.len() - 1) as f64;
-        //
-        //let x = sum - score;
-        //
-        //let k = -2.0 + f64::from((2u32).pow(runner.len() as u32 - 1));
-        //
-        //x / k.mul_add(1.0 - x, 1.0)
+        f64::sqrt(out / max as f64)
     }
+}
 
-    //fn entropy(runner: &[u128], total: &[u128]) -> f64 {
-    //    // Calculate total counts
-    //    let total_count: u128 = total.iter().sum();
-    //
-    //    // Calculate probabilities
-    //    let probabilities: Vec<f64> = runner
-    //        .iter()
-    //        .map(|&r| {
-    //            if total_count > 0 {
-    //                r as f64 / total_count as f64
-    //            } else {
-    //                0.0
-    //            }
-    //        })
-    //        .collect();
-    //
-    //    let entropy_value: f64 = probabilities
-    //        .iter()
-    //        .filter_map(|&p| {
-    //            if p > 0.0 {
-    //                Some(-p * p.log2()) // Using natural logarithm
-    //            } else {
-    //                None
-    //            }
-    //        })
-    //        .sum();
-    //
-    //    entropy_value
-    //}
+const fn find_max(classes: usize) -> usize {
+    (classes * classes - (classes % 2)) / 4
 }
